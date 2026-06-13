@@ -307,6 +307,46 @@ check_root() {
     [[ $EUID -eq 0 ]] || die "请使用 root 用户运行此脚本"
 }
 
+get_public_ip4() {
+    local ip=""
+    if command -v curl &>/dev/null; then
+        ip=$(curl -s4m 3 https://api.ipify.org || curl -s4m 3 https://ifconfig.me || curl -s4m 3 https://ip.sb || echo "")
+    elif command -v wget &>/dev/null; then
+        ip=$(wget -qT 3 -O- https://api.ipify.org || wget -qT 3 -O- https://ifconfig.me || wget -qT 3 -O- https://ip.sb || echo "")
+    fi
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$ip"
+    else
+        ip -4 addr show scope global 2>/dev/null | grep inet | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1 || echo ""
+    fi
+}
+
+get_public_ip6() {
+    local ip=""
+    if command -v curl &>/dev/null; then
+        ip=$(curl -s6m 3 https://api6.ipify.org || curl -s6m 3 https://ifconfig.co || curl -s6m 3 https://ip.sb || echo "")
+    elif command -v wget &>/dev/null; then
+        ip=$(wget -qT 3 -O- https://api6.ipify.org || wget -qT 3 -O- https://ifconfig.co || wget -qT 3 -O- https://ip.sb || echo "")
+    fi
+    if [[ "$ip" == *":"* ]]; then
+        echo "$ip"
+    else
+        ip -6 addr show scope global 2>/dev/null | grep inet6 | grep -v '::1' | awk '{print $2}' | cut -d/ -f1 | head -1 || echo ""
+    fi
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        ss -tln | grep -q ":${port}\b" && return 0
+    elif command -v netstat &>/dev/null; then
+        netstat -tln | grep -q ":${port}\b" && return 0
+    elif command -v lsof &>/dev/null; then
+        lsof -i :"$port" &>/dev/null && return 0
+    fi
+    return 1
+}
+
 detect_arch() {
     local arch
     arch=$(uname -m)
@@ -575,7 +615,7 @@ do_install() {
 
     local rp
     rp=$(random_port)
-    while [[ -n "$other_port" && "$rp" == "$other_port" ]]; do
+    while [[ -n "$other_port" && "$rp" == "$other_port" ]] || port_in_use "$rp"; do
         rp=$(random_port)
     done
 
@@ -587,6 +627,11 @@ do_install() {
     local port="${ip:-$rp}"
     if [[ -n "$other_port" && "$port" == "$other_port" ]]; then
         err "错误: 端口与已安装的 Snell ${other_suffix} 端口 (${other_port}) 冲突！"
+        pause
+        return
+    fi
+    if port_in_use "$port"; then
+        err "错误: 端口 ${port} 已被系统其他服务占用，请更换端口！"
         pause
         return
     fi
@@ -874,6 +919,12 @@ do_modify() {
         return
     fi
 
+    if [[ -z "$CUR_PORT" || ! "$CUR_PORT" =~ ^[0-9]+$ ]]; then
+        err "错误: 无法解析当前端口号，配置文件可能损坏！"
+        pause
+        return
+    fi
+
     local config_file
     config_file=$(get_config_file)
 
@@ -910,6 +961,11 @@ do_modify() {
                 pause
                 return
             fi
+            if port_in_use "$np"; then
+                err "错误: 端口 ${np} 已被系统其他服务占用，请更换端口！"
+                pause
+                return
+            fi
             if [[ "${CUR_IPV6}" == "true" ]]; then
                 sed -i "s|^listen\s*=.*|listen = [::]:${np}|" "$config_file"
             else
@@ -933,7 +989,11 @@ do_modify() {
                 nv="true"
                 sed -i "s|^listen\s*=.*|listen = [::]:${CUR_PORT}|" "$config_file"
             fi
-            sed -i "s|^ipv6\s*=.*|ipv6 = ${nv}|" "$config_file"
+            if grep -q "^ipv6\s*=" "$config_file"; then
+                sed -i "s|^ipv6\s*=.*|ipv6 = ${nv}|" "$config_file"
+            else
+                echo "ipv6 = ${nv}" >> "$config_file"
+            fi
             ok "IPv6 -> ${nv}"
             ;;
         4)
@@ -990,8 +1050,8 @@ do_show() {
     echo ""
 
     local ip4 ip6
-    ip4=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
-    ip6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1)
+    ip4=$(get_public_ip4)
+    ip6=$(get_public_ip6)
     [[ -z "$ip4" ]] && ip4="N/A"
     [[ -z "$ip6" ]] && ip6="N/A"
 
@@ -1096,11 +1156,11 @@ show_client_config() {
     local ip4="${4:-}" ip6="${5:-}"
 
     if [[ -z "$ip4" ]]; then
-        ip4=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+        ip4=$(get_public_ip4)
         [[ -z "$ip4" ]] && ip4="YOUR_IP"
     fi
     if [[ -z "$ip6" ]]; then
-        ip6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1)
+        ip6=$(get_public_ip6)
         [[ -z "$ip6" ]] && ip6="YOUR_IPv6"
     fi
 
@@ -1384,7 +1444,9 @@ EOF
 
     info "正在应用内核优化参数 (sysctl -p)..."
     echo ""
-    sysctl -p && sysctl --system
+    modprobe tcp_bbr &>/dev/null || true
+    sysctl -p &>/dev/null || true
+    sysctl --system &>/dev/null || true
     echo ""
     ok "BBR 与协议栈调优参数已成功应用！"
     pause
