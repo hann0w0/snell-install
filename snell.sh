@@ -49,7 +49,25 @@ get_service_file() {
     echo "/etc/systemd/system/$(get_service_name).service"
 }
 
-# 动态获取官网最新版本
+# 验证下载包在 Surge 服务器上是否存在 (通过 HEAD 快速检测)
+check_url_exists() {
+    local ver="$1"
+    local test_url="${DOWNLOAD_BASE}/snell-server-${ver}-linux-amd64.zip"
+    if command -v curl &>/dev/null; then
+        local code
+        code=$(curl -fsSL -o /dev/null -w "%{http_code}" --connect-timeout 2 "$test_url" 2>/dev/null || echo "404")
+        [[ "$code" == "200" ]] && return 0 || return 1
+    elif command -v wget &>/dev/null; then
+        if wget -q --spider --timeout=2 "$test_url" &>/dev/null; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    return 1
+}
+
+# 动态获取并双重验证官网最新可下载版本
 fetch_latest_versions() {
     # 确保有 curl/wget，检查网络
     if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
@@ -64,20 +82,28 @@ fetch_latest_versions() {
     fi
 
     if [[ -n "$html" ]]; then
-        # 提取格式如 v6.x.x 或 v6.x.xbx 类似的版本号
-        local v6_parsed
-        v6_parsed=$(echo "$html" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | head -n 1 || true)
-        if [[ -n "$v6_parsed" ]]; then
-            V6_VERSION="$v6_parsed"
-        fi
+        # 1. 动态探测并校验 V6 可下载最新版 (测试前 5 个候选版本)
+        local v6_candidates
+        v6_candidates=$(echo "$html" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | sort -u -r | head -n 5 || true)
+        for candidate in $v6_candidates; do
+            if check_url_exists "$candidate"; then
+                V6_VERSION="$candidate"
+                break
+            fi
+        done
 
-        local v5_parsed
-        v5_parsed=$(echo "$html" | grep -oE 'v5\.[0-9]+\.[0-9]+' | head -n 1 || true)
-        if [[ -n "$v5_parsed" ]]; then
-            V5_VERSION="$v5_parsed"
-        fi
+        # 2. 动态探测并校验 V5 可下载最新版 (测试前 5 个候选版本)
+        local v5_candidates
+        v5_candidates=$(echo "$html" | grep -oE 'v5\.[0-9]+\.[0-9]+' | sort -u -r | head -n 5 || true)
+        for candidate in $v5_candidates; do
+            if check_url_exists "$candidate"; then
+                V5_VERSION="$candidate"
+                break
+            fi
+        done
     fi
 }
+
 
 # ============================================================
 # 颜色
@@ -113,19 +139,46 @@ pause() {
 # 自动持久化保存并安装快捷指令 'snell'
 # ============================================================
 install_shortcut() {
-    local script_dest="/usr/local/bin/snell.sh"
+    local script_dest="/root/snell.sh"
     local link_dest="/usr/local/bin/snell"
+    local github_url="https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh"
     
-    # 支持在进程替换 (如 bash <(curl ...)) 场景下稳定写入，
-    # 优先使用 cat "$0" 对内存流进行转储，失败时则回退到 cp
-    if [[ "$(readlink -f "$0")" != "$script_dest" ]]; then
-        cat "$0" > "$script_dest" 2>/dev/null || cp -f "$0" "$script_dest" 2>/dev/null || true
-        chmod +x "$script_dest" 2>/dev/null || true
+    # 检查当前运行的脚本是否已经是目标路径。如果是，说明已经是本地安装的版本在运行，无需重复下载/拷贝
+    local cur_real_path
+    cur_real_path=$(readlink -f "$0" 2>/dev/null || echo "")
+    if [[ "$cur_real_path" == "$script_dest" ]]; then
+        return 0
     fi
     
-    # 建立软链接，以便用户在终端键入 'snell' 即可直接启动面板
-    if [[ -f "$script_dest" && ! -L "$link_dest" ]]; then
+    # 否则，我们需要将脚本部署到目标路径
+    info "正在为您配置本地快捷调用指令 'snell'..."
+    
+    local success=false
+    # 场景 1：如果是通过本地普通文件运行 (如 ./snell.sh)，且不是管道或系统 shell 二进制
+    local base_name
+    base_name=$(basename "$cur_real_path" 2>/dev/null || echo "")
+    if [[ -f "$0" ]] && [[ "$base_name" != "bash" && "$base_name" != "sh" && "$base_name" != "zsh" && "$cur_real_path" != *"/dev/fd/"* ]]; then
+        if cp -f "$0" "$script_dest" 2>/dev/null; then
+            success=true
+        fi
+    fi
+    
+    # 场景 2：如果是通过网络管道一键运行 (如 curl | bash)，我们直接从 github 拉取最新版本并写入目标路径
+    if [[ "$success" == "false" ]]; then
+        if command -v curl &>/dev/null; then
+            curl -fsSL --connect-timeout 5 "$github_url" > "$script_dest" 2>/dev/null && success=true
+        elif command -v wget &>/dev/null; then
+            wget -q --timeout=5 -O "$script_dest" "$github_url" 2>/dev/null && success=true
+        fi
+    fi
+    
+    if [[ "$success" == "true" ]]; then
+        chmod +x "$script_dest" 2>/dev/null || true
+        # 建立快捷软链接
         ln -sf "$script_dest" "$link_dest" 2>/dev/null || true
+        ok "快捷指令 'snell' 部署成功！以后在终端键入 'snell' 即可直接启动面板。"
+    else
+        warn "快捷指令 'snell' 部署失败，但不影响当前面板的使用。"
     fi
 }
 
@@ -1293,7 +1346,7 @@ do_cron_menu() {
     local cron_job
     local cron_time
     cron_time=$(get_cron_time)
-    cron_job="${cron_time} root /bin/bash $(readlink -f "$0") --cron-check &>/dev/null"
+    cron_job="${cron_time} root /bin/bash /root/snell.sh --cron-check &>/dev/null"
 
     # 检查 cron 是否已配置
     local is_enabled=false
