@@ -1,8 +1,5 @@
 # Snell Server 多版本一键管理脚本 (V5 / V6 同步共存)
 
-[![License](https://img.shields.io/github/license/github/docs.svg?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20CentOS%20%7C%20Fedora%20%7C%20Arch-blue.svg?style=flat-square)](https://github.com)
-
 一个功能强大的 Linux Snell Server 交互式一键管理脚本。支持在同一台 VPS 上**同时安装并独立运行 V5 稳定版与 V6 协议**，互不干扰，提供极简的快捷命令操作与全方位的系统优化支持。
 
 ---
@@ -115,3 +112,6 @@ proxies:
 
 ---
 
+## 📄 开源许可证
+
+本项目基于 [MIT License](LICENSE) 许可证开源。

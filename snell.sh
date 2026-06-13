@@ -139,8 +139,7 @@ pause() {
 # 自动持久化保存并安装快捷指令 'snell'
 # ============================================================
 install_shortcut() {
-    local script_dest="/root/snell.sh"
-    local link_dest="/usr/local/bin/snell"
+    local script_dest="/usr/local/bin/snell"
     local github_url="https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh"
     
     # 检查当前运行的脚本是否已经是目标路径。如果是，说明已经是本地安装的版本在运行，无需重复下载/拷贝
@@ -174,9 +173,7 @@ install_shortcut() {
     
     if [[ "$success" == "true" ]]; then
         chmod +x "$script_dest" 2>/dev/null || true
-        # 建立快捷软链接
-        ln -sf "$script_dest" "$link_dest" 2>/dev/null || true
-        ok "快捷指令 'snell' 部署成功！以后在终端键入 'snell' 即可直接启动面板。"
+        ok "快捷指令 'snell' 部署成功！以后在终端键入 'snell' 或 'sudo snell' 即可直接启动面板。"
     else
         warn "快捷指令 'snell' 部署失败，但不影响当前面板的使用。"
     fi
@@ -1459,7 +1456,7 @@ do_cron_menu() {
     local cron_job
     local cron_time
     cron_time=$(get_cron_time)
-    cron_job="${cron_time} root /bin/bash /root/snell.sh --cron-check &>/dev/null"
+    cron_job="${cron_time} root /bin/bash /usr/local/bin/snell --cron-check &>/dev/null"
 
     # 检查 cron 是否已配置
     local is_enabled=false
