@@ -1270,27 +1270,44 @@ do_bbr() {
             sed -i "/${kw}/d" /etc/sysctl.conf
         done
 
-        # 3. 清理对应的配置项（不论等号两边是否有空格，都彻底移除）
+        # 3. 清理对应的配置项（不论等号两边是否有空格，都彻底移除，包含可能存在冲突的第三方 TCP/BBR 配置键名）
         local keys=(
+            # 基础文件句柄限制
             "fs.file-max" "fs.nr_open"
+            
+            # 队列与最大连接数限制
             "net.core.somaxconn" "net.ipv4.tcp_max_syn_backlog" "net.ipv4.tcp_abort_on_overflow"
-            "net.ipv4.ip_local_port_range" "net.core.netdev_max_backlog"
+            "net.ipv4.ip_local_port_range" "net.core.netdev_max_backlog" "net.ipv4.tcp_max_tw_buckets"
+            
+            # 拥塞控制及排队算法 (核心冲突点)
             "net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_fastopen"
+            
+            # 缓冲区与内存控制 (大带宽/长距离核心冲突)
             "net.ipv4.tcp_window_scaling" "net.ipv4.tcp_adv_win_scale" "net.ipv4.tcp_moderate_rcvbuf"
-            "net.core.rmem_max" "net.core.wmem_max" "net.ipv4.tcp_rmem" "net.ipv4.tcp_wmem"
-            "net.ipv4.udp_rmem_min" "net.ipv4.udp_wmem_min"
+            "net.core.rmem_max" "net.core.wmem_max" "net.core.rmem_default" "net.core.wmem_default"
+            "net.ipv4.tcp_rmem" "net.ipv4.tcp_wmem" "net.ipv4.tcp_mem"
+            "net.ipv4.udp_rmem_min" "net.ipv4.udp_wmem_min" "net.ipv4.udp_mem"
+            
+            # IPv6 专项优化与邻居表限制
             "net.ipv6.conf.all.disable_ipv6" "net.ipv6.conf.default.disable_ipv6" "net.ipv6.conf.lo.disable_ipv6"
             "net.ipv6.conf.all.forwarding" "net.ipv6.conf.default.forwarding"
-            "net.ipv6.route.max_size"
+            "net.ipv6.route.max_size" "net.ipv6.neigh.default.gc_thresh"
             "net.ipv6.neigh.default.gc_thresh1" "net.ipv6.neigh.default.gc_thresh2" "net.ipv6.neigh.default.gc_thresh3"
-            "net.ipv4.tcp_timestamps" "net.ipv4.tcp_tw_reuse" "net.ipv4.tcp_fin_timeout"
+            
+            # 时间戳与网络连接回收 (包含已被内核弃用且有NAT严重 Bug 的 tcp_tw_recycle)
+            "net.ipv4.tcp_timestamps" "net.ipv4.tcp_tw_reuse" "net.ipv4.tcp_tw_recycle" "net.ipv4.tcp_fin_timeout"
             "net.ipv4.tcp_slow_start_after_idle"
+            
+            # 安全与路由转发
             "net.ipv4.conf.all.rp_filter" "net.ipv4.conf.default.rp_filter" "net.ipv4.ip_forward"
             "net.ipv4.conf.all.route_localnet" "net.ipv4.tcp_rfc1337" "net.ipv4.tcp_ecn"
-            "net.ipv4.tcp_no_metrics_save" "net.ipv4.tcp_sack" "net.ipv4.tcp_fack" "net.ipv4.tcp_mtu_probing"
+            "net.ipv4.tcp_syncookies"
+            
+            # SACK/FACK 网络重传控制
+            "net.ipv4.tcp_no_metrics_save" "net.ipv4.tcp_sack" "net.ipv4.tcp_fack" "net.ipv4.tcp_dsack" "net.ipv4.tcp_mtu_probing"
         )
         for key in "${keys[@]}"; do
-            sed -i "/^[[:space:]]*${key}[[:space:]]*=/d" /etc/sysctl.conf
+            sed -i "/^[[:space:]#]*${key}[[:space:]]*=/d" /etc/sysctl.conf
         done
 
         # 4. 清除多余的连续空白行
