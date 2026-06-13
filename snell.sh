@@ -1220,37 +1220,150 @@ do_bbr() {
     clear
     echo ""
     hr
-    echo -e "  ${BOLD}${C} BBR 优化${NC}"
+    echo -e "  ${BOLD}${C} BBR 与网络深度调优${NC}"
     hr
     echo ""
 
     info "正在清理系统中已存在的旧 BBR 与 TCP 优化参数..."
     if [[ -f /etc/sysctl.conf ]]; then
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
-        sed -i '/net.core.wmem_max/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_fin_timeout/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_window_scaling/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_timestamps/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_sack/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_no_metrics_save/d' /etc/sysctl.conf
-        sed -i '/BBR Blast/d' /etc/sysctl.conf
+        # 1. 尝试使用全新起止标记进行整块清理 (防止多次运行时中文注释及变量叠加)
+        sed -i '/# === SNELL_SYSCTL_START ===/,/# === SNELL_SYSCTL_END ===/d' /etc/sysctl.conf
+
+        # 2. 清洗可能存在的任何变体旧中文注释（避免以前重复写入留下的注释叠加）
+        local chinese_keywords=(
+            "文件句柄"
+            "并发"
+            "网络队列"
+            "连接优化"
+            "拥塞控制"
+            "窗口与缓冲区"
+            "大带宽"
+            "长距离"
+            "IPv6"
+            "路由缓存"
+            "邻居表"
+            "时间戳"
+            "连接回收"
+            "安全与转发"
+            "其他辅助"
+            "BBR"
+            "SNELL_SYSCTL"
+            "大缓冲区"
+            "足够跑满"
+            "跑满"
+            "丢包卡顿"
+            "短连接"
+            "延迟优化"
+            "历史 RTT"
+            "历史RTT"
+            "突发灵活"
+            "平滑暴力"
+            "BBR Blast"
+        )
+        for kw in "${chinese_keywords[@]}"; do
+            sed -i "/${kw}/d" /etc/sysctl.conf
+        done
+
+        # 3. 清理对应的配置项（不论等号两边是否有空格，都彻底移除）
+        local keys=(
+            "fs.file-max" "fs.nr_open"
+            "net.core.somaxconn" "net.ipv4.tcp_max_syn_backlog" "net.ipv4.tcp_abort_on_overflow"
+            "net.ipv4.ip_local_port_range" "net.core.netdev_max_backlog"
+            "net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_fastopen"
+            "net.ipv4.tcp_window_scaling" "net.ipv4.tcp_adv_win_scale" "net.ipv4.tcp_moderate_rcvbuf"
+            "net.core.rmem_max" "net.core.wmem_max" "net.ipv4.tcp_rmem" "net.ipv4.tcp_wmem"
+            "net.ipv4.udp_rmem_min" "net.ipv4.udp_wmem_min"
+            "net.ipv6.conf.all.disable_ipv6" "net.ipv6.conf.default.disable_ipv6" "net.ipv6.conf.lo.disable_ipv6"
+            "net.ipv6.conf.all.forwarding" "net.ipv6.conf.default.forwarding"
+            "net.ipv6.route.max_size"
+            "net.ipv6.neigh.default.gc_thresh1" "net.ipv6.neigh.default.gc_thresh2" "net.ipv6.neigh.default.gc_thresh3"
+            "net.ipv4.tcp_timestamps" "net.ipv4.tcp_tw_reuse" "net.ipv4.tcp_fin_timeout"
+            "net.ipv4.tcp_slow_start_after_idle"
+            "net.ipv4.conf.all.rp_filter" "net.ipv4.conf.default.rp_filter" "net.ipv4.ip_forward"
+            "net.ipv4.conf.all.route_localnet" "net.ipv4.tcp_rfc1337" "net.ipv4.tcp_ecn"
+            "net.ipv4.tcp_no_metrics_save" "net.ipv4.tcp_sack" "net.ipv4.tcp_fack" "net.ipv4.tcp_mtu_probing"
+        )
+        for key in "${keys[@]}"; do
+            sed -i "/^[[:space:]]*${key}[[:space:]]*=/d" /etc/sysctl.conf
+        done
+
+        # 4. 清除多余的连续空白行
         sed -i '/^$/N;/^\n$/D' /etc/sysctl.conf
-        ok "旧参数清理完成"
+        ok "旧优化参数及中文注释清理完成"
     fi
 
-    echo ""
-    info "正在拉取并运行 BBR 优化脚本..."
-    echo ""
-    if ! bash <(curl -fsSL https://raw.githubusercontent.com/xmg0828/bbr/main/bbr.sh); then
-        err "BBR 脚本运行失败，请检查网络或 curl 是否安装"
-    fi
+    # 确保文件末尾有换行符
+    [[ -f /etc/sysctl.conf ]] && sed -i '$a\' /etc/sysctl.conf
 
+    info "正在写入全新 BBR 与网络协议栈调优参数..."
+    cat << 'EOF' >> /etc/sysctl.conf
+# === SNELL_SYSCTL_START ===
+# 1. 基础文件句柄限制 (适配高并发)
+fs.file-max                     = 6815744
+fs.nr_open                      = 6815744
+
+# 2. 网络队列与连接优化
+net.core.somaxconn              = 65535
+net.ipv4.tcp_max_syn_backlog    = 8192
+net.ipv4.tcp_abort_on_overflow  = 1
+net.ipv4.ip_local_port_range    = 1024 65535
+net.core.netdev_max_backlog     = 65536
+
+# 3. BBR 与 拥塞控制
+net.core.default_qdisc          = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen           = 3
+
+# 4. TCP 窗口与缓冲区优化 (针对大带宽/长距离链路)
+net.ipv4.tcp_window_scaling     = 1
+net.ipv4.tcp_adv_win_scale      = 1
+net.ipv4.tcp_moderate_rcvbuf    = 1
+net.core.rmem_max               = 67108864
+net.core.wmem_max               = 67108864
+net.ipv4.tcp_rmem               = 4096 87380 67108864
+net.ipv4.tcp_wmem               = 4096 65536 67108864
+net.ipv4.udp_rmem_min           = 8192
+net.ipv4.udp_wmem_min           = 8192
+
+# 5. IPv6 专项开启与调优
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
+# 扩大 IPv6 路由缓存和邻居表，防止高并发时丢包
+net.ipv6.route.max_size = 1048576
+net.ipv6.neigh.default.gc_thresh1 = 1024
+net.ipv6.neigh.default.gc_thresh2 = 4096
+net.ipv6.neigh.default.gc_thresh3 = 8192
+
+# 6. 时间戳与连接回收
+net.ipv4.tcp_timestamps         = 1
+net.ipv4.tcp_tw_reuse           = 1
+net.ipv4.tcp_fin_timeout        = 30
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# 7. 安全与转发配置
+net.ipv4.conf.all.rp_filter     = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.ip_forward             = 1
+net.ipv4.conf.all.route_localnet= 1
+net.ipv4.tcp_rfc1337            = 1
+net.ipv4.tcp_ecn                = 0
+
+# 8. 其他辅助优化
+net.ipv4.tcp_no_metrics_save    = 1
+net.ipv4.tcp_sack               = 1
+net.ipv4.tcp_fack               = 1
+net.ipv4.tcp_mtu_probing        = 1
+# === SNELL_SYSCTL_END ===
+EOF
+
+    info "正在应用内核优化参数 (sysctl -p)..."
     echo ""
+    sysctl -p && sysctl --system
+    echo ""
+    ok "BBR 与协议栈调优参数已成功应用！"
     pause
 }
 
