@@ -21,17 +21,17 @@
 
 ### 推荐命令 (使用 curl)
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh)
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh)"
 ```
 
 ### 备用命令 (使用 wget)
 ```bash
-wget -qO- https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh | bash
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh)"
 ```
 
 > 💡 **提示**：首次成功运行一键命令后，您无需再次复制此命令。今后只需在您的服务器终端直接输入：
 > ```bash
-> snell
+> sudo snell
 > ```
 > 即可瞬间呼出管理菜单。
 

@@ -142,6 +142,14 @@ install_shortcut() {
     local script_dest="/usr/local/bin/snell"
     local github_url="https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh"
     
+    # 清理旧版本遗留的缓存与软链接
+    if [[ -L "$script_dest" ]]; then
+        rm -f "$script_dest" 2>/dev/null || true
+    fi
+    if [[ -f "/root/snell.sh" ]]; then
+        rm -f "/root/snell.sh" 2>/dev/null || true
+    fi
+    
     # 检查当前运行的脚本是否已经是目标路径。如果是，说明已经是本地安装的版本在运行，无需重复下载/拷贝
     local cur_real_path
     cur_real_path=$(readlink -f "$0" 2>/dev/null || echo "")
@@ -284,6 +292,7 @@ show_menu() {
     echo -e "  ${G}8${NC}.  BBR 优化"
     echo -e "  ${G}9${NC}.  时间同步"
     echo -e "  ${G}10${NC}. 定时更新"
+    echo -e "  ${G}11${NC}. 更新脚本"
     echo ""
     echo -e "  ${DIM}0${NC}.  退出"
     echo ""
@@ -1497,6 +1506,61 @@ do_cron_menu() {
     pause
 }
 
+# ============================================================
+# 11. 更新管理脚本自身
+# ============================================================
+update_self() {
+    clear
+    echo ""
+    hr
+    echo -e "  ${BOLD}${C} 更新 Snell Server 管理脚本${NC}"
+    hr
+    echo ""
+
+    local github_url="https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh"
+    local script_dest="/usr/local/bin/snell"
+
+    info "正在从 GitHub 仓库获取最新版管理脚本..."
+    echo -e "  ${DIM}${github_url}${NC}"
+    echo ""
+
+    local tmp
+    tmp=$(mktemp)
+    
+    local success=false
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 5 "$github_url" > "$tmp" 2>/dev/null && success=true
+    elif command -v wget &>/dev/null; then
+        wget -q --timeout=5 -O "$tmp" "$github_url" 2>/dev/null && success=true
+    fi
+
+    if [[ "$success" == "true" ]]; then
+        # 简单校验下载到的文件是否包含 bash 声明，防止下到 404 网页或空白
+        if grep -q "#!/usr/bin/env bash" "$tmp" || grep -q "#!/bin/bash" "$tmp"; then
+            # 覆写目标文件并赋予权限
+            cat "$tmp" > "$script_dest"
+            chmod +x "$script_dest"
+            rm -f "$tmp"
+            
+            # 清理可能存在的旧版本残留（以防万一）
+            [[ -f "/root/snell.sh" ]] && rm -f "/root/snell.sh" 2>/dev/null || true
+            
+            ok "管理脚本已成功更新至最新版本！"
+            echo ""
+            info "正在重新载入并启动新版脚本..."
+            sleep 1
+            exec "$script_dest"
+        else
+            rm -f "$tmp"
+            err "更新失败：下载的文件内容校验未通过（可能网络连接超时或源文件损坏）"
+        fi
+    else
+        rm -f "$tmp"
+        err "更新失败：无法连接到 GitHub 仓库，请检查您的网络连接"
+    fi
+    pause
+}
+
 # 静默检查与升级，由 cron 触发 (依次循环检测每一个可能存在的实例)
 check_and_auto_update() {
     # 1. 检测系统架构与依赖
@@ -1659,7 +1723,7 @@ main() {
     
     while true; do
         show_menu
-        read -rp "  选择 [0-10]: " ch
+        read -rp "  选择 [0-11]: " ch
         case "$ch" in
             1) do_install ;;
             2) do_update ;;
@@ -1671,6 +1735,7 @@ main() {
             8) do_bbr ;;
             9) do_sync_time ;;
             10) do_cron_menu ;;
+            11) update_self ;;
             0) echo ""; info "再见"; echo ""; exit 0 ;;
             *) warn "无效选项"; sleep 0.3 ;;
         esac
