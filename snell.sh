@@ -345,12 +345,14 @@ write_db_val() {
 }
 
 sync_traffic_to_db() {
-    command -v iptables &>/dev/null || return 0
+    if ! command -v iptables &>/dev/null && ! command -v ip6tables &>/dev/null; then
+        return 0
+    fi
     
     local db_file
     db_file=$(get_traffic_db)
     
-    # 自动检测并补全正在运行实例的 iptables 规则 (自愈机制)
+    # 自动检测并补全正在运行实例的 iptables/ip6tables 规则 (自愈机制)
     local port
     port=$(grep -E "^listen\s*=" "${CONFIG_DIR}/snell-server-${SUFFIX}.conf" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
     if [[ -n "$port" ]] && systemctl is-active --quiet "snell-${SUFFIX}" 2>/dev/null; then
@@ -364,11 +366,26 @@ sync_traffic_to_db() {
     last_raw_out=$(read_db_val "$db_file" "LAST_RAW_OUT" "0")
     
     local cur_raw_in cur_raw_out
-    cur_raw_in=$(iptables -vxnL INPUT 2>/dev/null | grep "snell-${SUFFIX}-in" | awk '{print $2}' || echo "0")
-    cur_raw_out=$(iptables -vxnL OUTPUT 2>/dev/null | grep "snell-${SUFFIX}-out" | awk '{print $2}' || echo "0")
+    local cur_raw_in_v4=0 cur_raw_out_v4=0
+    local cur_raw_in_v6=0 cur_raw_out_v6=0
     
-    [[ -n "$cur_raw_in" && "$cur_raw_in" =~ ^[0-9]+$ ]] || cur_raw_in=0
-    [[ -n "$cur_raw_out" && "$cur_raw_out" =~ ^[0-9]+$ ]] || cur_raw_out=0
+    if command -v iptables &>/dev/null; then
+        cur_raw_in_v4=$(iptables -vxnL INPUT 2>/dev/null | grep "snell-${SUFFIX}-in" | awk '{sum+=$2} END {print sum+0}')
+        cur_raw_out_v4=$(iptables -vxnL OUTPUT 2>/dev/null | grep "snell-${SUFFIX}-out" | awk '{sum+=$2} END {print sum+0}')
+    fi
+    
+    if command -v ip6tables &>/dev/null; then
+        cur_raw_in_v6=$(ip6tables -vxnL INPUT 2>/dev/null | grep "snell-${SUFFIX}-in" | awk '{sum+=$2} END {print sum+0}')
+        cur_raw_out_v6=$(ip6tables -vxnL OUTPUT 2>/dev/null | grep "snell-${SUFFIX}-out" | awk '{sum+=$2} END {print sum+0}')
+    fi
+    
+    [[ -n "$cur_raw_in_v4" && "$cur_raw_in_v4" =~ ^[0-9]+$ ]] || cur_raw_in_v4=0
+    [[ -n "$cur_raw_out_v4" && "$cur_raw_out_v4" =~ ^[0-9]+$ ]] || cur_raw_out_v4=0
+    [[ -n "$cur_raw_in_v6" && "$cur_raw_in_v6" =~ ^[0-9]+$ ]] || cur_raw_in_v6=0
+    [[ -n "$cur_raw_out_v6" && "$cur_raw_out_v6" =~ ^[0-9]+$ ]] || cur_raw_out_v6=0
+    
+    cur_raw_in=$(( cur_raw_in_v4 + cur_raw_in_v6 ))
+    cur_raw_out=$(( cur_raw_out_v4 + cur_raw_out_v6 ))
     
     local diff_in diff_out
     if (( cur_raw_in >= last_raw_in )); then
@@ -492,13 +509,23 @@ format_bytes() {
 setup_traffic_iptables() {
     local p="$1"
     [[ -n "$p" ]] || return 0
-    command -v iptables &>/dev/null || return 0
     
-    if ! iptables -C INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null || true
+    if command -v iptables &>/dev/null; then
+        if ! iptables -C INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; then
+            iptables -I INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null || true
+        fi
+        if ! iptables -C OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; then
+            iptables -I OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null || true
+        fi
     fi
-    if ! iptables -C OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; then
-        iptables -I OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null || true
+    
+    if command -v ip6tables &>/dev/null; then
+        if ! ip6tables -C INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; then
+            ip6tables -I INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null || true
+        fi
+        if ! ip6tables -C OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; then
+            ip6tables -I OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null || true
+        fi
     fi
     return 0
 }
@@ -507,14 +534,20 @@ clear_traffic_iptables() {
     local p="$1"
     local skip_sync="$2"
     [[ -n "$p" ]] || return 0
-    command -v iptables &>/dev/null || return 0
     
     if [[ "$skip_sync" != "true" ]]; then
         sync_traffic_to_db
     fi
     
-    while iptables -D INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; do :; done
-    while iptables -D OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; do :; done
+    if command -v iptables &>/dev/null; then
+        while iptables -D INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; do :; done
+        while iptables -D OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; do :; done
+    fi
+    
+    if command -v ip6tables &>/dev/null; then
+        while ip6tables -D INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; do :; done
+        while ip6tables -D OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; do :; done
+    fi
     return 0
 }
 
