@@ -1730,13 +1730,37 @@ do_sync_time() {
         conflict_detected=true
     fi
 
-    # 4. 如果时区和同步服务已经配置完毕，且没有冲突服务在运行，则无需重复配置
+    # 4. 如果时区和同步服务已经配置完毕，且没有冲突服务在运行，询问是否需要重新安装
     if [[ "$cur_tz" == "Asia/Shanghai" && "$service_active" == "true" && "$conflict_detected" == "false" ]]; then
         ok "检测到系统已配置 Asia/Shanghai 时区，且时间同步服务正常，无其他冲突服务！"
         echo -e "  系统当前时间: $(date)"
         echo ""
-        pause
-        return
+        clear_stdin
+        local sync_reinstall=""
+        read -rp "  是否要重新安装并净化时间同步服务？(y/N) [默认 N]: " sync_reinstall
+        local sync_reinstall_val="${sync_reinstall:-n}"
+        if [[ "$sync_reinstall_val" != "y" && "$sync_reinstall_val" != "Y" ]]; then
+            return
+        fi
+
+        info "正在清除当前系统关于时间同步的所有数据与残留..."
+        systemctl disable --now chrony 2>/dev/null || true
+        systemctl disable --now chronyd 2>/dev/null || true
+
+        if command -v apt-get &>/dev/null; then
+            apt-get purge -y chrony &>/dev/null || true
+            apt-get autoremove -y &>/dev/null || true
+        elif command -v dnf &>/dev/null; then
+            dnf remove -y chrony &>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum remove -y chrony &>/dev/null || true
+        elif command -v pacman &>/dev/null; then
+            pacman -Rns --noconfirm chrony &>/dev/null || true
+        fi
+
+        rm -rf /etc/chrony /etc/chrony.conf /etc/chrony/chrony.conf /etc/chrony.keys /var/lib/chrony /var/log/chrony 2>/dev/null || true
+        ok "时间同步服务已彻底清除！"
+        echo ""
     fi
 
     # 5. 检测是否是容器环境 (LXC/OpenVZ/Docker)
