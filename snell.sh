@@ -128,6 +128,7 @@ err()     { echo -e "  ${R}✘${NC} $*"; }
 die()     { err "$*"; exit 1; }
 
 hr() { printf "  ${DIM}"; printf '%.s─' {1..48}; printf "${NC}\n"; }
+dhr() { printf "  ${DIM}"; printf '%.s┈' {1..48}; printf "${NC}\n"; }
 
 pause() {
     echo ""
@@ -280,23 +281,24 @@ show_menu() {
     echo -e "  ${BOLD}V5 状态${NC}: ${sc5}${BOLD}${st5}${NC}   版本: ${BOLD}${vt5_padded}${NC}   自启: ${ae5}"
     echo -e "  ${BOLD}V6 状态${NC}: ${sc6}${BOLD}${st6}${NC}   版本: ${BOLD}${vt6_padded}${NC}   自启: ${ae6}"
     echo ""
-    hr
-    echo ""
+    echo -e "  ${DIM}▎安装管理${NC}"
     echo -e "  ${G}1${NC}.  安装 Snell"
     echo -e "  ${G}2${NC}.  更新 Snell"
     echo -e "  ${G}3${NC}.  卸载 Snell"
+    echo -e "  ${DIM}  ----------------------------------------${NC}"
+    echo -e "  ${DIM}▎配置与服务${NC}"
     echo -e "  ${G}4${NC}.  修改配置"
     echo -e "  ${G}5${NC}.  查看配置"
     echo -e "  ${G}6${NC}.  重启服务"
     echo -e "  ${G}7${NC}.  运行日志"
+    echo -e "  ${DIM}  ----------------------------------------${NC}"
+    echo -e "  ${DIM}▎系统优化${NC}"
     echo -e "  ${G}8${NC}.  BBR 优化"
     echo -e "  ${G}9${NC}.  时间同步"
     echo -e "  ${G}10${NC}. 定时更新"
     echo -e "  ${G}11${NC}. 更新脚本"
     echo ""
     echo -e "  ${DIM}0${NC}.  退出"
-    echo ""
-    hr
     echo ""
 }
 
@@ -390,6 +392,26 @@ random_psk() {
     fi
 }
 
+# 验证端口号是否在有效范围内
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+        err "无效端口号，请输入 1-65535 范围内的数字"
+        return 1
+    fi
+    return 0
+}
+
+# 获取另一个版本实例的端口号（用于冲突检测）
+get_other_port() {
+    local other_suffix="v5"
+    [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
+    local other_cfg="${CONFIG_DIR}/snell-server-${other_suffix}.conf"
+    if [[ -f "$other_cfg" ]]; then
+        grep -E "^listen\s*=" "$other_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$'
+    fi
+}
+
 get_download_url() {
     local ver="$1"
     if [[ "$ARCH" == "armv7l" && "$ver" == "$V6_VERSION" ]]; then
@@ -410,6 +432,13 @@ download_and_install() {
 
     if ! wget -q --show-progress -O "${tmp}/snell.zip" "$url"; then
         rm -rf "$tmp"; die "下载失败"
+    fi
+
+    # 校验下载文件大小，防止不完整的下载
+    local zip_size
+    zip_size=$(wc -c < "${tmp}/snell.zip" 2>/dev/null || echo "0")
+    if [[ "$zip_size" -lt 1000 ]]; then
+        rm -rf "$tmp"; die "下载的文件异常过小 (${zip_size} bytes)，可能不完整"
     fi
 
     unzip -o -q "${tmp}/snell.zip" -d "$tmp"
@@ -605,13 +634,8 @@ do_install() {
     echo ""
 
     # 端口检测，防实例间碰撞
-    local other_suffix="v5"
-    [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
-    local other_cfg="${CONFIG_DIR}/snell-server-${other_suffix}.conf"
     local other_port=""
-    if [[ -f "$other_cfg" ]]; then
-        other_port=$(grep -E "^listen\s*=" "$other_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
-    fi
+    other_port=$(get_other_port)
 
     local rp
     rp=$(random_port)
@@ -625,7 +649,13 @@ do_install() {
 
     read -rp "  端口 [回车随机 ${rp}]: " ip
     local port="${ip:-$rp}"
+    if ! validate_port "$port"; then
+        pause
+        return
+    fi
     if [[ -n "$other_port" && "$port" == "$other_port" ]]; then
+        local other_suffix="v5"
+        [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
         err "错误: 端口与已安装的 Snell ${other_suffix} 端口 (${other_port}) 冲突！"
         pause
         return
@@ -944,19 +974,20 @@ do_modify() {
         return
     fi
 
-    local other_suffix="v5"
-    [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
-    local other_cfg="${CONFIG_DIR}/snell-server-${other_suffix}.conf"
     local other_port=""
-    if [[ -f "$other_cfg" ]]; then
-        other_port=$(grep -E "^listen\s*=" "$other_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
-    fi
+    other_port=$(get_other_port)
 
     case "$mc" in
         1)
             read -rp "  新端口: " np
             [[ -n "$np" ]] || { warn "未输入"; pause; return; }
+            if ! validate_port "$np"; then
+                pause
+                return
+            fi
             if [[ -n "$other_port" && "$np" == "$other_port" ]]; then
+                local other_suffix="v5"
+                [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
                 err "错误: 新端口与已安装的 Snell ${other_suffix} 端口 (${other_port}) 冲突！"
                 pause
                 return
@@ -1471,8 +1502,11 @@ do_sync_time() {
     
     # 2. 检查 chrony 或其他同步服务是否运行，且已配置好
     local service_active=false
+    # 动态检测 chrony 配置路径
+    local chrony_conf_check="/etc/chrony.conf"
+    [[ -d /etc/chrony ]] && chrony_conf_check="/etc/chrony/chrony.conf"
     if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet chronyd 2>/dev/null; then
-        if [[ -f /etc/chrony/chrony.conf ]] && grep -q "ntp.aliyun.com" /etc/chrony/chrony.conf 2>/dev/null; then
+        if [[ -f "$chrony_conf_check" ]] && grep -q "ntp.aliyun.com" "$chrony_conf_check" 2>/dev/null; then
             service_active=true
         fi
     fi
@@ -1504,7 +1538,10 @@ do_sync_time() {
     fi
 
     info "正在写入 chrony.conf 配置..."
-    cat <<EOF > /etc/chrony/chrony.conf
+    # 动态检测 chrony 配置路径（Debian/Ubuntu 为 /etc/chrony/chrony.conf，CentOS/RHEL 为 /etc/chrony.conf）
+    local chrony_conf="/etc/chrony.conf"
+    [[ -d /etc/chrony ]] && chrony_conf="/etc/chrony/chrony.conf"
+    cat <<EOF > "$chrony_conf"
 server ntp.aliyun.com iburst
 server ntp.tencent.com iburst
 driftfile /var/lib/chrony/chrony.drift
@@ -1734,7 +1771,7 @@ smooth_progress() {
     fi
 
     # 如果有后台任务，启动任务并在等待时播放转圈动画 + 进度平缓上升
-    eval "$run_cmd" &
+    bash -c "$run_cmd" &
     local pid=$!
     local current_pct=$start_pct
     local spin='-\|/'
@@ -1790,14 +1827,17 @@ main() {
     hr
     echo ""
     
-    # 步骤 1: 检测系统架构
-    smooth_progress 0 45 "正在检测系统架构..." "detect_arch"
+    # 步骤 1: 检测系统架构（同步执行确保 ARCH 变量正确设置）
+    smooth_progress 0 45 "正在检测系统架构..."
+    detect_arch
     
-    # 步骤 2: 检测系统依赖并静默补全
-    smooth_progress 45 90 "正在检查并准备系统依赖 (wget, unzip)..." "ensure_deps &>/dev/null"
+    # 步骤 2: 检测系统依赖并静默补全（同步执行确保依赖就绪）
+    smooth_progress 45 90 "正在检查并准备系统依赖 (wget, unzip)..."
+    ensure_deps &>/dev/null
     
     # 步骤 3: 准备运行环境并安装快捷方式
-    smooth_progress 90 100 "加载完成！" "install_shortcut"
+    smooth_progress 90 100 "加载完成！"
+    install_shortcut
     sleep 0.2
     
     while true; do
