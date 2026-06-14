@@ -305,14 +305,14 @@ show_menu() {
     echo -e "  ${G}5${NC}.  查看配置"
     echo -e "  ${G}6${NC}.  重启服务"
     echo -e "  ${G}7${NC}.  运行日志"
+    echo -e "  ${G}8${NC}.  流量统计"
+    echo -e "  ${G}9${NC}.  更新脚本"
     echo ""
     echo -e "  ${DIM}▎系统优化${NC}"
     echo ""
-    echo -e "  ${G}8${NC}.  BBR 优化"
-    echo -e "  ${G}9${NC}.  时间同步"
-    echo -e "  ${G}10${NC}. 定时更新"
-    echo -e "  ${G}11${NC}. 更新脚本"
-    echo -e "  ${G}12${NC}. 流量统计"
+    echo -e "  ${G}10${NC}. BBR 优化"
+    echo -e "  ${G}11${NC}. 时间同步"
+    echo -e "  ${G}12${NC}. 定时更新"
     echo ""
     echo -e "  ${DIM}0${NC}.  退出"
     echo ""
@@ -1636,6 +1636,81 @@ do_logs() {
 }
 
 # ============================================================
+# 7.4. 实时动态流量监控 (像 log 一样跳动刷新)
+# ============================================================
+do_live_traffic_monitor() {
+    local old_sfx="$SUFFIX"
+    local v5_bin="${INSTALL_DIR}/snell-server-v5"
+    local v6_bin="${INSTALL_DIR}/snell-server-v6"
+    
+    local v5_ver="N/A"
+    [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
+    local v6_ver="N/A"
+    [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
+    
+    local db_v5 db_v6
+    db_v5=$(SUFFIX="v5" get_traffic_db)
+    db_v6=$(SUFFIX="v6" get_traffic_db)
+    
+    while true; do
+        if [[ -f "$v5_bin" ]]; then
+            SUFFIX="v5" sync_traffic_to_db &>/dev/null
+        fi
+        if [[ -f "$v6_bin" ]]; then
+            SUFFIX="v6" sync_traffic_to_db &>/dev/null
+        fi
+        
+        clear
+        echo ""
+        hr
+        echo -e "  ${BOLD}${C} Snell 流量实时监控 (每 2 秒自动刷新)${NC}"
+        echo -e "  ${DIM} 提示: 正在动态监控流量变化，按任意键退回到菜单${NC}"
+        hr
+        echo ""
+        
+        local has_any=false
+        if [[ -f "$v5_bin" ]]; then
+            local v5_in v5_out
+            v5_in=$(read_db_val "$db_v5" "IN_BYTES" "0")
+            v5_out=$(read_db_val "$db_v5" "OUT_BYTES" "0")
+            
+            echo -e "  ${BOLD}Snell V5 (${v5_ver}) 实时流量:${NC}"
+            echo -e "  ${DIM}──${NC} 入站流量 (下载) : ${BOLD}$(format_bytes "$v5_in")${NC}"
+            echo -e "  ${DIM}──${NC} 出站流量 (上传) : ${BOLD}$(format_bytes "$v5_out")${NC}"
+            echo -e "  ${DIM}──${NC} 累计总流量      : ${G}${BOLD}$(format_bytes $(( v5_in + v5_out )))${NC}"
+            echo ""
+            has_any=true
+        fi
+        
+        if [[ -f "$v6_bin" ]]; then
+            local v6_in v6_out
+            v6_in=$(read_db_val "$db_v6" "IN_BYTES" "0")
+            v6_out=$(read_db_val "$db_v6" "OUT_BYTES" "0")
+            
+            echo -e "  ${BOLD}Snell V6 (${v6_ver}) 实时流量:${NC}"
+            echo -e "  ${DIM}──${NC} 入站流量 (下载) : ${BOLD}$(format_bytes "$v6_in")${NC}"
+            echo -e "  ${DIM}──${NC} 出站流量 (上传) : ${BOLD}$(format_bytes "$v6_out")${NC}"
+            echo -e "  ${DIM}──${NC} 累计总流量      : ${G}${BOLD}$(format_bytes $(( v6_in + v6_out )))${NC}"
+            echo ""
+            has_any=true
+        fi
+        
+        if [[ "$has_any" == "false" ]]; then
+            err "未检测到已安装的 Snell 服务"
+            SUFFIX="$old_sfx"
+            pause
+            return
+        fi
+        
+        local key
+        if read -s -t 2 -n 1 key; then
+            break
+        fi
+    done
+    SUFFIX="$old_sfx"
+}
+
+# ============================================================
 # 7.5. 流量统计
 # ============================================================
 do_traffic_menu() {
@@ -1725,12 +1800,13 @@ do_traffic_menu() {
         echo -e "  ${G}1${NC}. 手动重置 Snell v5 流量统计"
         echo -e "  ${G}2${NC}. 手动重置 Snell v6 流量统计"
         echo -e "  ${G}3${NC}. 配置自动重置规则"
+        echo -e "  ${G}4${NC}. 实时动态流量监控 (像 log 一样跳动刷新)"
         echo ""
         echo -e "  ${DIM}0. 返回主菜单${NC}"
         echo ""
         
         local choice
-        read -rp "  请选择 [0-3]: " choice
+        read -rp "  请选择 [0-4]: " choice
         case "$choice" in
             1)
                 if [[ ! -f "$v5_bin" ]]; then
@@ -1864,6 +1940,9 @@ do_traffic_menu() {
                 deploy_traffic_cron &>/dev/null
                 SUFFIX="$old_sfx"
                 pause
+                ;;
+            4)
+                do_live_traffic_monitor
                 ;;
             0)
                 break
@@ -2554,11 +2633,11 @@ main() {
             5) do_show ;;
             6) do_restart ;;
             7) do_logs ;;
-            8) do_bbr ;;
-            9) do_sync_time ;;
-            10) do_cron_menu ;;
-            11) update_self ;;
-            12) do_traffic_menu ;;
+            8) do_traffic_menu ;;
+            9) update_self ;;
+            10) do_bbr ;;
+            11) do_sync_time ;;
+            12) do_cron_menu ;;
             0) echo ""; info "再见"; echo ""; exit 0 ;;
             *) warn "无效选项"; sleep 0.3 ;;
         esac
