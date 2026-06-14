@@ -210,15 +210,18 @@ auto_select_or_ask_version() {
     echo -e "  ${BOLD}请选择要${action}的 Snell 版本:${NC}"
     echo -e "  ${G}1${NC}. V5"
     echo -e "  ${G}2${NC}. V6"
+    echo -e "  ${G}0${NC}. 返回主菜单"
     echo ""
     local choice
-    read -rp "  请选择 [1/2, 默认 1]: " choice
+    read -rp "  请选择 [1/2/0, 默认 1]: " choice
     case "$choice" in
         2) SUFFIX="v6" ;;
+        0) echo ""; return 1 ;;
         *) SUFFIX="v5" ;;
     esac
     ok "已选择: Snell ${SUFFIX}"
     echo ""
+    return 0
 }
 
 # ============================================================
@@ -570,6 +573,29 @@ open_firewall() {
     ok "防火墙已放行"
 }
 
+close_firewall() {
+    local p="$1"
+    [[ -n "$p" ]] || return
+    info "清理防火墙规则 (${p})"
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw delete allow "$p" &>/dev/null || true
+    fi
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --remove-port="${p}/tcp" &>/dev/null || true
+        firewall-cmd --permanent --remove-port="${p}/udp" &>/dev/null || true
+        firewall-cmd --reload &>/dev/null || true
+    fi
+    if command -v iptables &>/dev/null; then
+        iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    fi
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+        ip6tables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    fi
+    ok "防火墙规则已清理"
+}
+
 # 从配置文件读取值，只匹配第一个 = 号，避免 base64 尾部 = 被吞
 cfg_val() {
     local cfg
@@ -762,7 +788,7 @@ do_update() {
     hr
     echo ""
 
-    auto_select_or_ask_version "更新"
+    auto_select_or_ask_version "更新" || return
 
     local bin_path version_file service_name
     bin_path=$(get_bin_path)
@@ -862,12 +888,14 @@ do_uninstall() {
         echo -e "  ${G}1${NC}. 卸载 V5"
         echo -e "  ${G}2${NC}. 卸载 V6"
         echo -e "  ${G}3${NC}. 同时卸载 V5 和 V6"
+        echo -e "  ${G}0${NC}. 返回主菜单"
         echo ""
         local choice
-        read -rp "  请选择 [1-3, 默认 1]: " choice
+        read -rp "  请选择 [1-3/0, 默认 1]: " choice
         case "$choice" in
             2) mode="v6" ;;
             3) mode="all" ;;
+            0) return ;;
             *) mode="v5" ;;
         esac
         echo ""
@@ -876,56 +904,79 @@ do_uninstall() {
     local cf
     if [[ "$mode" == "all" ]]; then
         warn "将停止并删除所有的 Snell 服务"
-        read -rp "  确认同时卸载 V5 和 V6？(y/N) " cf
+        read -rp "  确认同时卸载 V5 和 V6？(Y/n) " cf
     else
         warn "将停止并删除 Snell ${mode} 服务"
-        read -rp "  确认卸载 Snell ${mode}？(y/N) " cf
+        read -rp "  确认卸载 Snell ${mode}？(Y/n) " cf
     fi
+    cf="${cf:-Y}"
     [[ "$cf" == "y" || "$cf" == "Y" ]] || { info "已取消"; pause; return; }
+
+    # 卸载前获取端口号以便后续清理防火墙规则
+    local v5_port=""
+    local v6_port=""
+    local v5_cfg="${CONFIG_DIR}/snell-server-v5.conf"
+    local v6_cfg="${CONFIG_DIR}/snell-server-v6.conf"
+    if [[ -f "$v5_cfg" ]]; then
+        v5_port=$(grep -E "^listen\s*=" "$v5_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+    fi
+    if [[ -f "$v6_cfg" ]]; then
+        v6_port=$(grep -E "^listen\s*=" "$v6_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+    fi
 
     # 执行服务停止与文件删除
     if [[ "$mode" == "v5" || "$mode" == "all" ]]; then
         info "正在卸载 Snell V5..."
+        [[ -n "$v5_port" ]] && close_firewall "$v5_port"
         systemctl stop snell-v5 2>/dev/null || true
         systemctl disable snell-v5 2>/dev/null || true
         rm -f "${INSTALL_DIR}/snell-server-v5" "/etc/systemd/system/snell-v5.service" "${CONFIG_DIR}/.version-v5"
-        ok "Snell V5 已卸载"
+        if [[ "$mode" == "v5" ]]; then
+            rm -f "$v5_cfg"
+            # 检查如果此时 V6 也不存在了，则清理整个配置目录
+            if [[ ! -f "${INSTALL_DIR}/snell-server-v6" ]]; then
+                rm -rf "$CONFIG_DIR" 2>/dev/null || true
+            fi
+        fi
+        ok "Snell V5 已卸载并清除配置、自启与防火墙端口"
     fi
 
     if [[ "$mode" == "v6" || "$mode" == "all" ]]; then
         info "正在卸载 Snell V6..."
+        [[ -n "$v6_port" ]] && close_firewall "$v6_port"
         systemctl stop snell-v6 2>/dev/null || true
         systemctl disable snell-v6 2>/dev/null || true
         rm -f "${INSTALL_DIR}/snell-server-v6" "/etc/systemd/system/snell-v6.service" "${CONFIG_DIR}/.version-v6"
-        ok "Snell V6 已卸载"
+        if [[ "$mode" == "v6" ]]; then
+            rm -f "$v6_cfg"
+            # 检查如果此时 V5 也不存在了，则清理整个配置目录
+            if [[ ! -f "${INSTALL_DIR}/snell-server-v5" ]]; then
+                rm -rf "$CONFIG_DIR" 2>/dev/null || true
+            fi
+        fi
+        ok "Snell V6 已卸载并清除配置、自启与防火墙端口"
     fi
 
     systemctl daemon-reload
 
-    # 询问是否删除配置文件
-    echo ""
+    # 如果是全部卸载，清理定时任务、快捷方式和整个配置目录并直接退出
     if [[ "$mode" == "all" ]]; then
-        read -rp "  是否同时删除所有配置文件？(Y/n) " dc
-        if [[ "$dc" == "n" || "$dc" == "N" ]]; then
-            info "配置文件已保留在 ${CONFIG_DIR}"
-        else
-            rm -rf "$CONFIG_DIR"
-            ok "所有配置文件已删除"
+        info "正在清理定时更新任务..."
+        if [[ -f /etc/crontab ]]; then
+            sed -i '/--cron-check/d' /etc/crontab
+            systemctl restart cron &>/dev/null || systemctl restart crond &>/dev/null || true
         fi
-    else
-        local target_cfg="${CONFIG_DIR}/snell-server-${mode}.conf"
-        read -rp "  是否同时删除 Snell ${mode} 的配置文件？(Y/n) " dc
-        if [[ "$dc" == "n" || "$dc" == "N" ]]; then
-            info "配置文件已保留在 ${target_cfg}"
-        else
-            rm -f "$target_cfg"
-            ok "Snell ${mode} 配置文件已删除"
-        fi
-    fi
-
-    # 确保如果是全部卸载，且配置目录为空，清理整个目录
-    if [[ ! -f "${INSTALL_DIR}/snell-server-v5" && ! -f "${INSTALL_DIR}/snell-server-v6" ]]; then
-        rm -rf "$CONFIG_DIR" 2>/dev/null || true
+        
+        info "正在清除所有配置文件..."
+        rm -rf "$CONFIG_DIR"
+        
+        info "正在清除快捷调用指令 'snell'..."
+        rm -f "/usr/local/bin/snell"
+        
+        ok "所有 Snell 服务、配置文件、定时更新及快捷方式已彻底清除！"
+        echo ""
+        ok "卸载流程已全部完成，面板将自动退出。"
+        exit 0
     fi
 
     echo ""
@@ -944,7 +995,7 @@ do_modify() {
     hr
     echo ""
 
-    auto_select_or_ask_version "修改配置"
+    auto_select_or_ask_version "修改配置" || return
 
     if ! parse_config; then
         err "配置文件不存在"
@@ -1000,6 +1051,7 @@ do_modify() {
                 pause
                 return
             fi
+            close_firewall "$CUR_PORT"
             if [[ "${CUR_IPV6}" == "true" ]]; then
                 sed -i "s|^listen\s*=.*|listen = [::]:${np}|" "$config_file"
             else
@@ -1251,7 +1303,7 @@ do_restart() {
     hr
     echo ""
 
-    auto_select_or_ask_version "重启服务"
+    auto_select_or_ask_version "重启服务" || return
 
     local service_name
     service_name=$(get_service_name)
@@ -1288,7 +1340,7 @@ do_logs() {
     hr
     echo ""
 
-    auto_select_or_ask_version "查看日志"
+    auto_select_or_ask_version "查看日志" || return
 
     local service_name
     service_name=$(get_service_name)
