@@ -293,11 +293,11 @@ show_menu() {
     echo -e "  ${BOLD}V5 状态${NC}: ${sc5}${BOLD}${st5}${NC}   版本: ${BOLD}${vt5_padded}${NC}   自启: ${ae5}"
     echo -e "  ${BOLD}V6 状态${NC}: ${sc6}${BOLD}${st6}${NC}   版本: ${BOLD}${vt6_padded}${NC}   自启: ${ae6}"
     echo ""
-    echo -e "  ${DIM}▎安装管理${NC}"
+    echo -e "  ${DIM}▎安装管理${NC}                    ${DIM}▎系统优化${NC}"
     echo ""
-    echo -e "  ${G}1${NC}.  安装 Snell"
-    echo -e "  ${G}2${NC}.  更新 Snell"
-    echo -e "  ${G}3${NC}.  卸载 Snell"
+    echo -e "  ${G}1${NC}.  安装 Snell                ${G}10${NC}. BBR 优化"
+    echo -e "  ${G}2${NC}.  更新 Snell                ${G}11${NC}. 时间同步"
+    echo -e "  ${G}3${NC}.  卸载 Snell                ${G}12${NC}. 定时更新"
     echo ""
     echo -e "  ${DIM}▎配置与服务${NC}"
     echo ""
@@ -307,12 +307,6 @@ show_menu() {
     echo -e "  ${G}7${NC}.  运行日志"
     echo -e "  ${G}8${NC}.  流量统计"
     echo -e "  ${G}9${NC}.  更新脚本"
-    echo ""
-    echo -e "  ${DIM}▎系统优化${NC}"
-    echo ""
-    echo -e "  ${G}10${NC}. BBR 优化"
-    echo -e "  ${G}11${NC}. 时间同步"
-    echo -e "  ${G}12${NC}. 定时更新"
     echo ""
     echo -e "  ${DIM}0${NC}.  退出"
     echo ""
@@ -1636,9 +1630,9 @@ do_logs() {
 }
 
 # ============================================================
-# 7.4. 实时动态流量监控 (像 log 一样跳动刷新)
+# 7.5. 流量统计
 # ============================================================
-do_live_traffic_monitor() {
+do_traffic_menu() {
     local old_sfx="$SUFFIX"
     local v5_bin="${INSTALL_DIR}/snell-server-v5"
     local v6_bin="${INSTALL_DIR}/snell-server-v6"
@@ -1648,10 +1642,6 @@ do_live_traffic_monitor() {
     local v6_ver="N/A"
     [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
     
-    local db_v5 db_v6
-    db_v5=$(SUFFIX="v5" get_traffic_db)
-    db_v6=$(SUFFIX="v6" get_traffic_db)
-    
     while true; do
         if [[ -f "$v5_bin" ]]; then
             SUFFIX="v5" sync_traffic_to_db &>/dev/null
@@ -1660,76 +1650,10 @@ do_live_traffic_monitor() {
             SUFFIX="v6" sync_traffic_to_db &>/dev/null
         fi
         
-        clear
-        echo ""
-        hr
-        echo -e "  ${BOLD}${C} Snell 流量实时监控 (每 2 秒自动刷新)${NC}"
-        echo -e "  ${DIM} 提示: 正在动态监控流量变化，按任意键退回到菜单${NC}"
-        hr
-        echo ""
+        local db_v5 db_v6
+        db_v5=$(SUFFIX="v5" get_traffic_db)
+        db_v6=$(SUFFIX="v6" get_traffic_db)
         
-        local has_any=false
-        if [[ -f "$v5_bin" ]]; then
-            local v5_in v5_out
-            v5_in=$(read_db_val "$db_v5" "IN_BYTES" "0")
-            v5_out=$(read_db_val "$db_v5" "OUT_BYTES" "0")
-            
-            echo -e "  ${BOLD}Snell V5 (${v5_ver}) 实时流量:${NC}"
-            echo -e "  ${DIM}──${NC} 入站流量 (下载) : ${BOLD}$(format_bytes "$v5_in")${NC}"
-            echo -e "  ${DIM}──${NC} 出站流量 (上传) : ${BOLD}$(format_bytes "$v5_out")${NC}"
-            echo -e "  ${DIM}──${NC} 累计总流量      : ${G}${BOLD}$(format_bytes $(( v5_in + v5_out )))${NC}"
-            echo ""
-            has_any=true
-        fi
-        
-        if [[ -f "$v6_bin" ]]; then
-            local v6_in v6_out
-            v6_in=$(read_db_val "$db_v6" "IN_BYTES" "0")
-            v6_out=$(read_db_val "$db_v6" "OUT_BYTES" "0")
-            
-            echo -e "  ${BOLD}Snell V6 (${v6_ver}) 实时流量:${NC}"
-            echo -e "  ${DIM}──${NC} 入站流量 (下载) : ${BOLD}$(format_bytes "$v6_in")${NC}"
-            echo -e "  ${DIM}──${NC} 出站流量 (上传) : ${BOLD}$(format_bytes "$v6_out")${NC}"
-            echo -e "  ${DIM}──${NC} 累计总流量      : ${G}${BOLD}$(format_bytes $(( v6_in + v6_out )))${NC}"
-            echo ""
-            has_any=true
-        fi
-        
-        if [[ "$has_any" == "false" ]]; then
-            err "未检测到已安装的 Snell 服务"
-            SUFFIX="$old_sfx"
-            pause
-            return
-        fi
-        
-        local key
-        if read -s -t 2 -n 1 key; then
-            break
-        fi
-    done
-    SUFFIX="$old_sfx"
-}
-
-# ============================================================
-# 7.5. 流量统计
-# ============================================================
-do_traffic_menu() {
-    local old_sfx="$SUFFIX"
-    while true; do
-        clear
-        echo ""
-        hr
-        echo -e "  ${BOLD}${C} ❯ SNELL 流量监控面板${NC}"
-        hr
-        echo ""
-        
-        SUFFIX="v5"
-        sync_traffic_to_db
-        local v5_bin="${INSTALL_DIR}/snell-server-v5"
-        local v5_ver="N/A"
-        [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
-        local db_v5
-        db_v5=$(get_traffic_db)
         local v5_in v5_out v5_reset v5_auto v5_day v5_hour v5_min
         v5_in=$(read_db_val "$db_v5" "IN_BYTES" "0")
         v5_out=$(read_db_val "$db_v5" "OUT_BYTES" "0")
@@ -1746,13 +1670,6 @@ do_traffic_menu() {
             v5_rule="${DIM}未启用${NC}"
         fi
         
-        SUFFIX="v6"
-        sync_traffic_to_db
-        local v6_bin="${INSTALL_DIR}/snell-server-v6"
-        local v6_ver="N/A"
-        [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
-        local db_v6
-        db_v6=$(get_traffic_db)
         local v6_in v6_out v6_reset v6_auto v6_day v6_hour v6_min
         v6_in=$(read_db_val "$db_v6" "IN_BYTES" "0")
         v6_out=$(read_db_val "$db_v6" "OUT_BYTES" "0")
@@ -1769,7 +1686,12 @@ do_traffic_menu() {
             v6_rule="${DIM}未启用${NC}"
         fi
         
-        SUFFIX="$old_sfx"
+        clear
+        echo ""
+        hr
+        echo -e "  ${BOLD}${C} ❯ SNELL 流量监控面板 (每 2 秒自动刷新)${NC}"
+        hr
+        echo ""
         
         if [[ -f "$v5_bin" ]]; then
             echo -e "  ${BOLD}Snell (${v5_ver}) 流量数据:${NC}"
@@ -1800,67 +1722,68 @@ do_traffic_menu() {
         echo -e "  ${G}1${NC}. 手动重置 Snell v5 流量统计"
         echo -e "  ${G}2${NC}. 手动重置 Snell v6 流量统计"
         echo -e "  ${G}3${NC}. 配置自动重置规则"
-        echo -e "  ${G}4${NC}. 实时动态流量监控 (像 log 一样跳动刷新)"
         echo ""
         echo -e "  ${DIM}0. 返回主菜单${NC}"
         echo ""
         
-        local choice
-        read -rp "  请选择 [0-4]: " choice
-        case "$choice" in
-            1)
-                if [[ ! -f "$v5_bin" ]]; then
-                    err "Snell V5 未安装"; pause; continue
-                fi
-                local confirm_reset
-                read -rp "  确认清零 Snell V5 流量统计吗？(Y/n) " confirm_reset
-                confirm_reset="${confirm_reset:-Y}"
-                if [[ "$confirm_reset" == "y" || "$confirm_reset" == "Y" ]]; then
-                    SUFFIX="v5"
-                    reset_single_traffic "v5"
-                    SUFFIX="$old_sfx"
-                    ok "Snell V5 流量统计已重置"
-                    pause
-                fi
-                ;;
-            2)
-                if [[ ! -f "$v6_bin" ]]; then
-                    err "Snell V6 未安装"; pause; continue
-                fi
-                local confirm_reset
-                read -rp "  确认清零 Snell V6 流量统计吗？(Y/n) " confirm_reset
-                confirm_reset="${confirm_reset:-Y}"
-                if [[ "$confirm_reset" == "y" || "$confirm_reset" == "Y" ]]; then
-                    SUFFIX="v6"
-                    reset_single_traffic "v6"
-                    SUFFIX="$old_sfx"
-                    ok "Snell V6 流量统计已重置"
-                    pause
-                fi
-                ;;
-            3)
-                local sel_ver=""
-                if [[ -f "$v5_bin" && -f "$v6_bin" ]]; then
+        local choice=""
+        if read -t 2 -n 1 choice; then
+            case "$choice" in
+                1)
+                    if [[ ! -f "$v5_bin" ]]; then
+                        echo ""; err "Snell V5 未安装"; pause; continue
+                    fi
                     echo ""
-                    echo -e "  请选择要修改自动重置规则的 Snell 版本:"
-                    echo -e "  ${G}1${NC}. Snell (${v5_ver})"
-                    echo -e "  ${G}2${NC}. Snell (${v6_ver})"
-                    echo -e "  ${G}0${NC}. 返回"
+                    local confirm_reset
+                    read -rp "  确认清零 Snell V5 流量统计吗？(Y/n) " confirm_reset
+                    confirm_reset="${confirm_reset:-Y}"
+                    if [[ "$confirm_reset" == "y" || "$confirm_reset" == "Y" ]]; then
+                        SUFFIX="v5"
+                        reset_single_traffic "v5"
+                        SUFFIX="$old_sfx"
+                        ok "Snell V5 流量统计已重置"
+                        pause
+                    fi
+                    ;;
+                2)
+                    if [[ ! -f "$v6_bin" ]]; then
+                        echo ""; err "Snell V6 未安装"; pause; continue
+                    fi
                     echo ""
-                    local choice_ver
-                    read -rp "  请选择 [1/2/0]: " choice_ver
-                    case "$choice_ver" in
-                        2) sel_ver="v6" ;;
-                        0) SUFFIX="$old_sfx"; continue ;;
-                        *) sel_ver="v5" ;;
-                    esac
-                elif [[ -f "$v5_bin" ]]; then
-                    sel_ver="v5"
-                elif [[ -f "$v6_bin" ]]; then
-                    sel_ver="v6"
-                else
-                    err "未检测到已安装的 Snell"; pause; continue
-                fi
+                    local confirm_reset
+                    read -rp "  确认清零 Snell V6 流量统计吗？(Y/n) " confirm_reset
+                    confirm_reset="${confirm_reset:-Y}"
+                    if [[ "$confirm_reset" == "y" || "$confirm_reset" == "Y" ]]; then
+                        SUFFIX="v6"
+                        reset_single_traffic "v6"
+                        SUFFIX="$old_sfx"
+                        ok "Snell V6 流量统计已重置"
+                        pause
+                    fi
+                    ;;
+                3)
+                    echo ""
+                    local sel_ver=""
+                    if [[ -f "$v5_bin" && -f "$v6_bin" ]]; then
+                        echo -e "  请选择要修改自动重置规则的 Snell 版本:"
+                        echo -e "  ${G}1${NC}. Snell (${v5_ver})"
+                        echo -e "  ${G}2${NC}. Snell (${v6_ver})"
+                        echo -e "  ${G}0${NC}. 返回"
+                        echo ""
+                        local choice_ver
+                        read -rp "  请选择 [1/2/0]: " choice_ver
+                        case "$choice_ver" in
+                            2) sel_ver="v6" ;;
+                            0) SUFFIX="$old_sfx"; continue ;;
+                            *) sel_ver="v5" ;;
+                        esac
+                    elif [[ -f "$v5_bin" ]]; then
+                        sel_ver="v5"
+                    elif [[ -f "$v6_bin" ]]; then
+                        sel_ver="v6"
+                    else
+                        err "未检测到已安装的 Snell"; pause; continue
+                    fi
                 
                 SUFFIX="$sel_ver"
                 local db_file
@@ -1941,14 +1864,12 @@ do_traffic_menu() {
                 SUFFIX="$old_sfx"
                 pause
                 ;;
-            4)
-                do_live_traffic_monitor
-                ;;
             0)
                 break
                 ;;
         esac
-    done
+    fi
+done
 }
 
 sync_all_traffic() {
