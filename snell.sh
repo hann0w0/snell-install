@@ -293,20 +293,17 @@ show_menu() {
     echo -e "  ${BOLD}V5 状态${NC}: ${sc5}${BOLD}${st5}${NC}   版本: ${BOLD}${vt5_padded}${NC}   自启: ${ae5}"
     echo -e "  ${BOLD}V6 状态${NC}: ${sc6}${BOLD}${st6}${NC}   版本: ${BOLD}${vt6_padded}${NC}   自启: ${ae6}"
     echo ""
-    echo -e "  ${DIM}▎安装管理${NC}                    ${DIM}▎系统优化${NC}"
+    echo -e "  ${C}▎安装管理${NC}                    ${C}▎系统优化${NC}"
     echo ""
-    echo -e "  ${G}1${NC}.  安装 Snell                ${G}10${NC}. BBR 优化"
-    echo -e "  ${G}2${NC}.  更新 Snell                ${G}11${NC}. 时间同步"
-    echo -e "  ${G}3${NC}.  卸载 Snell                ${G}12${NC}. 定时更新"
+    echo -e "  ${G}1${NC}.  安装 Snell                ${G}4${NC}.  BBR 优化"
+    echo -e "  ${G}2${NC}.  更新 Snell                ${G}5${NC}.  时间同步"
+    echo -e "  ${G}3${NC}.  卸载 Snell                ${G}6${NC}.  定时更新"
     echo ""
-    echo -e "  ${DIM}▎配置与服务${NC}"
+    echo -e "  ${C}▎服务配置${NC}                    ${C}▎日常运维${NC}"
     echo ""
-    echo -e "  ${G}4${NC}.  修改配置"
-    echo -e "  ${G}5${NC}.  查看配置"
-    echo -e "  ${G}6${NC}.  重启服务"
-    echo -e "  ${G}7${NC}.  运行日志"
-    echo -e "  ${G}8${NC}.  流量统计"
-    echo -e "  ${G}9${NC}.  更新脚本"
+    echo -e "  ${G}7${NC}.  修改配置                  ${G}10${NC}. 运行日志"
+    echo -e "  ${G}8${NC}.  查看配置                  ${G}11${NC}. 流量统计"
+    echo -e "  ${G}9${NC}.  重启服务                  ${G}12${NC}. 更新脚本"
     echo ""
     echo -e "  ${DIM}0${NC}.  退出"
     echo ""
@@ -2550,15 +2547,15 @@ main() {
             1) do_install ;;
             2) do_update ;;
             3) do_uninstall ;;
-            4) do_modify ;;
-            5) do_show ;;
-            6) do_restart ;;
-            7) do_logs ;;
-            8) do_traffic_menu ;;
-            9) update_self ;;
-            10) do_bbr ;;
-            11) do_sync_time ;;
-            12) do_cron_menu ;;
+            4) do_bbr ;;
+            5) do_sync_time ;;
+            6) do_cron_menu ;;
+            7) do_modify ;;
+            8) do_show ;;
+            9) do_restart ;;
+            10) do_logs ;;
+            11) do_traffic_menu ;;
+            12) update_self ;;
             0) echo ""; info "再见"; echo ""; exit 0 ;;
             *) warn "无效选项"; sleep 0.3 ;;
         esac
