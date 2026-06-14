@@ -204,12 +204,21 @@ auto_select_or_ask_version() {
     elif [[ "$v5_exists" == "false" && "$v6_exists" == "true" ]]; then
         SUFFIX="v6"
         return 0
+    elif [[ "$v5_exists" == "false" && "$v6_exists" == "false" ]]; then
+        err "未检测到任何已安装的 Snell Server 实例，无法执行${action}。"
+        pause
+        return 1
     fi
     
     # 两个都存在，或者两个都不存在，让用户选择
+    local v5_ver="N/A"
+    local v6_ver="N/A"
+    [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
+    [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
+
     echo -e "  ${BOLD}请选择要${action}的 Snell 版本:${NC}"
-    echo -e "  ${G}1${NC}. V5"
-    echo -e "  ${G}2${NC}. V6"
+    echo -e "  ${G}1${NC}. Snell (${v5_ver})"
+    echo -e "  ${G}2${NC}. Snell (${v6_ver})"
     echo -e "  ${G}0${NC}. 返回主菜单"
     echo ""
     local choice
@@ -303,9 +312,219 @@ show_menu() {
     echo -e "  ${G}9${NC}.  时间同步"
     echo -e "  ${G}10${NC}. 定时更新"
     echo -e "  ${G}11${NC}. 更新脚本"
+    echo -e "  ${G}12${NC}. 流量统计"
     echo ""
     echo -e "  ${DIM}0${NC}.  退出"
     echo ""
+}
+
+# ============================================================
+# 流量统计核心辅助函数 (iptables Counters)
+# ============================================================
+get_traffic_db() {
+    echo "${CONFIG_DIR}/traffic-${SUFFIX}.db"
+}
+
+read_db_val() {
+    local db_file key default_val
+    db_file="$1"
+    key="$2"
+    default_val="${3:-0}"
+    if [[ -f "$db_file" ]]; then
+        grep -E "^${key}\s*=" "$db_file" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | tr -d '"'\'' ' || echo "$default_val"
+    else
+        echo "$default_val"
+    fi
+}
+
+write_db_val() {
+    local db_file key val
+    db_file="$1"
+    key="$2"
+    val="$3"
+    mkdir -p "$(dirname "$db_file")"
+    if [[ ! -f "$db_file" ]]; then
+        touch "$db_file"
+    fi
+    if grep -q "^${key}\s*=" "$db_file" 2>/dev/null; then
+        sed -i "s|^${key}\s*=.*|${key} = ${val}|" "$db_file"
+    else
+        echo "${key} = ${val}" >> "$db_file"
+    fi
+}
+
+sync_traffic_to_db() {
+    command -v iptables &>/dev/null || return 0
+    
+    local db_file
+    db_file=$(get_traffic_db)
+    
+    # 自动检测并补全正在运行实例的 iptables 规则 (自愈机制)
+    local port
+    port=$(grep -E "^listen\s*=" "${CONFIG_DIR}/snell-server-${SUFFIX}.conf" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+    if [[ -n "$port" ]] && systemctl is-active --quiet "snell-${SUFFIX}" 2>/dev/null; then
+        setup_traffic_iptables "$port" &>/dev/null
+    fi
+    
+    local saved_in saved_out last_raw_in last_raw_out
+    saved_in=$(read_db_val "$db_file" "IN_BYTES" "0")
+    saved_out=$(read_db_val "$db_file" "OUT_BYTES" "0")
+    last_raw_in=$(read_db_val "$db_file" "LAST_RAW_IN" "0")
+    last_raw_out=$(read_db_val "$db_file" "LAST_RAW_OUT" "0")
+    
+    local cur_raw_in cur_raw_out
+    cur_raw_in=$(iptables -vxnL INPUT 2>/dev/null | grep "snell-${SUFFIX}-in" | awk '{print $2}' || echo "0")
+    cur_raw_out=$(iptables -vxnL OUTPUT 2>/dev/null | grep "snell-${SUFFIX}-out" | awk '{print $2}' || echo "0")
+    
+    [[ -n "$cur_raw_in" && "$cur_raw_in" =~ ^[0-9]+$ ]] || cur_raw_in=0
+    [[ -n "$cur_raw_out" && "$cur_raw_out" =~ ^[0-9]+$ ]] || cur_raw_out=0
+    
+    local diff_in diff_out
+    if (( cur_raw_in >= last_raw_in )); then
+        diff_in=$(( cur_raw_in - last_raw_in ))
+    else
+        diff_in=$cur_raw_in
+    fi
+    
+    if (( cur_raw_out >= last_raw_out )); then
+        diff_out=$(( cur_raw_out - last_raw_out ))
+    else
+        diff_out=$cur_raw_out
+    fi
+    
+    local new_in new_out
+    new_in=$(( saved_in + diff_in ))
+    new_out=$(( saved_out + diff_out ))
+    
+    write_db_val "$db_file" "IN_BYTES" "$new_in"
+    write_db_val "$db_file" "OUT_BYTES" "$new_out"
+    write_db_val "$db_file" "LAST_RAW_IN" "$cur_raw_in"
+    write_db_val "$db_file" "LAST_RAW_OUT" "$cur_raw_out"
+    if ! grep -q "^LAST_RESET\s*=" "$db_file" 2>/dev/null; then
+        write_db_val "$db_file" "LAST_RESET" "\"$(date '+%Y-%m-%d %H:%M:%S')\""
+    fi
+    
+    check_and_trigger_auto_reset
+    return 0
+}
+
+check_and_trigger_auto_reset() {
+    local db_file
+    db_file=$(get_traffic_db)
+    [[ -f "$db_file" ]] || return 0
+    
+    local auto_reset
+    auto_reset=$(read_db_val "$db_file" "AUTO_RESET" "false")
+    [[ "$auto_reset" == "true" ]] || return 0
+    
+    local target_day reset_hour reset_min
+    target_day=$(read_db_val "$db_file" "RESET_DAY" "1")
+    reset_hour=$(read_db_val "$db_file" "RESET_HOUR" "0")
+    reset_min=$(read_db_val "$db_file" "RESET_MIN" "0")
+    
+    local cur_year cur_month cur_day cur_hour cur_min
+    cur_year=$(date +%Y)
+    cur_month=$(date +%m)
+    cur_day=$(date +%d)
+    cur_hour=$(date +%H)
+    cur_min=$(date +%M)
+    
+    cur_day=$((10#$cur_day))
+    cur_hour=$((10#$cur_hour))
+    cur_min=$((10#$cur_min))
+    
+    local max_days
+    case "$((10#$cur_month))" in
+        1|3|5|7|8|10|12) max_days=31 ;;
+        4|6|9|11) max_days=30 ;;
+        2)
+            local y=$((10#$cur_year))
+            if (( (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 )); then
+                max_days=29
+            else
+                max_days=28
+            fi
+            ;;
+        *) max_days=30 ;;
+    esac
+    
+    local actual_reset_day=$target_day
+    (( actual_reset_day > max_days )) && actual_reset_day=$max_days
+    
+    if (( cur_day == actual_reset_day )); then
+        local cur_mins=$(( cur_hour * 60 + cur_min ))
+        local reset_mins=$(( reset_hour * 60 + reset_min ))
+        if (( cur_mins >= reset_mins )); then
+            local last_reset_date
+            last_reset_date=$(read_db_val "$db_file" "LAST_RESET_DATE" "\"\"")
+            local today_str="${cur_year}-${cur_month}-${cur_day}"
+            if [[ "$last_reset_date" != "$today_str" ]]; then
+                write_db_val "$db_file" "IN_BYTES" "0"
+                write_db_val "$db_file" "OUT_BYTES" "0"
+                write_db_val "$db_file" "LAST_RAW_IN" "0"
+                write_db_val "$db_file" "LAST_RAW_OUT" "0"
+                write_db_val "$db_file" "LAST_RESET" "\"$(date '+%Y-%m-%d %H:%M:%S')\""
+                write_db_val "$db_file" "LAST_RESET_DATE" "$today_str"
+                
+                local port
+                port=$(grep -E "^listen\s*=" "${CONFIG_DIR}/snell-server-${SUFFIX}.conf" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+                if [[ -n "$port" ]]; then
+                    clear_traffic_iptables "$port" "true" &>/dev/null
+                    setup_traffic_iptables "$port" &>/dev/null
+                fi
+            fi
+        fi
+    fi
+    return 0
+}
+
+format_bytes() {
+    local bytes="$1"
+    local kb=1024
+    local mb=$(( kb * 1024 ))
+    local gb=$(( mb * 1024 ))
+    local tb=$(( gb * 1024 ))
+    
+    if (( bytes >= tb )); then
+        printf "%.2f TB" "$(awk "BEGIN {print $bytes/$tb}")"
+    elif (( bytes >= gb )); then
+        printf "%.2f GB" "$(awk "BEGIN {print $bytes/$gb}")"
+    elif (( bytes >= mb )); then
+        printf "%.2f MB" "$(awk "BEGIN {print $bytes/$mb}")"
+    elif (( bytes >= kb )); then
+        printf "%.2f KB" "$(awk "BEGIN {print $bytes/$kb}")"
+    else
+        printf "%d Bytes" "$bytes"
+    fi
+}
+
+setup_traffic_iptables() {
+    local p="$1"
+    [[ -n "$p" ]] || return 0
+    command -v iptables &>/dev/null || return 0
+    
+    if ! iptables -C INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null || true
+    fi
+    if ! iptables -C OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; then
+        iptables -I OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null || true
+    fi
+    return 0
+}
+
+clear_traffic_iptables() {
+    local p="$1"
+    local skip_sync="$2"
+    [[ -n "$p" ]] || return 0
+    command -v iptables &>/dev/null || return 0
+    
+    if [[ "$skip_sync" != "true" ]]; then
+        sync_traffic_to_db
+    fi
+    
+    while iptables -D INPUT -p tcp --dport "$p" -m comment --comment "snell-${SUFFIX}-in" -j ACCEPT &>/dev/null; do :; done
+    while iptables -D OUTPUT -p tcp --sport "$p" -m comment --comment "snell-${SUFFIX}-out" -j ACCEPT &>/dev/null; do :; done
+    return 0
 }
 
 # ============================================================
@@ -638,13 +857,15 @@ do_install() {
 
     # 版本
     echo -e "  ${BOLD}选择版本${NC}"
-    echo -e "  ${G}1${NC}. V5  (${V5_VERSION})"
-    echo -e "  ${G}2${NC}. V6  (${V6_VERSION})"
+    echo -e "  ${G}1${NC}. Snell (${V5_VERSION})"
+    echo -e "  ${G}2${NC}. Snell (${V6_VERSION})"
+    echo -e "  ${G}0${NC}. 返回主菜单"
     echo ""
-    read -rp "  选择 [1/2, 默认 1]: " vc
+    read -rp "  选择 [1/2/0, 默认 1]: " vc
     local sv
     case "$vc" in
         2) SUFFIX="v6"; sv="$V6_VERSION" ;;
+        0) echo ""; return ;;
         *) SUFFIX="v5"; sv="$V5_VERSION" ;;
     esac
     
@@ -665,6 +886,8 @@ do_install() {
     # 端口检测，防实例间碰撞
     local other_port=""
     other_port=$(get_other_port)
+    local other_suffix="v5"
+    [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
 
     local rp
     rp=$(random_port)
@@ -766,6 +989,7 @@ do_install() {
     service_name=$(get_service_name)
     systemctl enable "$service_name" &>/dev/null
     systemctl start "$service_name"
+    setup_traffic_iptables "$port"
 
     echo ""
     hr
@@ -884,10 +1108,15 @@ do_uninstall() {
         mode="v6"
     else
         # 两个都存在，让用户选择
+        local v5_ver="N/A"
+        local v6_ver="N/A"
+        [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
+        [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
+
         echo -e "  ${BOLD}请选择要卸载的 Snell 版本:${NC}"
-        echo -e "  ${G}1${NC}. 卸载 V5"
-        echo -e "  ${G}2${NC}. 卸载 V6"
-        echo -e "  ${G}3${NC}. 同时卸载 V5 和 V6"
+        echo -e "  ${G}1${NC}. Snell (${v5_ver})"
+        echo -e "  ${G}2${NC}. Snell (${v6_ver})"
+        echo -e "  ${G}3${NC}. 同时卸载所有版本"
         echo -e "  ${G}0${NC}. 返回主菜单"
         echo ""
         local choice
@@ -927,12 +1156,16 @@ do_uninstall() {
     # 执行服务停止与文件删除
     if [[ "$mode" == "v5" || "$mode" == "all" ]]; then
         info "正在卸载 Snell V5..."
-        [[ -n "$v5_port" ]] && close_firewall "$v5_port"
+        if [[ -n "$v5_port" ]]; then
+            close_firewall "$v5_port"
+            clear_traffic_iptables "$v5_port"
+        fi
         systemctl stop snell-v5 2>/dev/null || true
         systemctl disable snell-v5 2>/dev/null || true
         rm -f "${INSTALL_DIR}/snell-server-v5" "/etc/systemd/system/snell-v5.service" "${CONFIG_DIR}/.version-v5"
         if [[ "$mode" == "v5" ]]; then
             rm -f "$v5_cfg"
+            rm -f "${CONFIG_DIR}/traffic-v5.db" 2>/dev/null || true
             # 检查如果此时 V6 也不存在了，则清理整个配置目录
             if [[ ! -f "${INSTALL_DIR}/snell-server-v6" ]]; then
                 rm -rf "$CONFIG_DIR" 2>/dev/null || true
@@ -943,12 +1176,16 @@ do_uninstall() {
 
     if [[ "$mode" == "v6" || "$mode" == "all" ]]; then
         info "正在卸载 Snell V6..."
-        [[ -n "$v6_port" ]] && close_firewall "$v6_port"
+        if [[ -n "$v6_port" ]]; then
+            close_firewall "$v6_port"
+            clear_traffic_iptables "$v6_port"
+        fi
         systemctl stop snell-v6 2>/dev/null || true
         systemctl disable snell-v6 2>/dev/null || true
         rm -f "${INSTALL_DIR}/snell-server-v6" "/etc/systemd/system/snell-v6.service" "${CONFIG_DIR}/.version-v6"
         if [[ "$mode" == "v6" ]]; then
             rm -f "$v6_cfg"
+            rm -f "${CONFIG_DIR}/traffic-v6.db" 2>/dev/null || true
             # 检查如果此时 V5 也不存在了，则清理整个配置目录
             if [[ ! -f "${INSTALL_DIR}/snell-server-v5" ]]; then
                 rm -rf "$CONFIG_DIR" 2>/dev/null || true
@@ -961,9 +1198,9 @@ do_uninstall() {
 
     # 如果是全部卸载，清理定时任务、快捷方式和整个配置目录并直接退出
     if [[ "$mode" == "all" ]]; then
-        info "正在清理定时更新任务..."
+        info "正在清理定时更新与流量统计任务..."
         if [[ -f /etc/crontab ]]; then
-            sed -i '/--cron-check/d' /etc/crontab
+            sed -i '/\/snell/d' /etc/crontab 2>/dev/null || true
             systemctl restart cron &>/dev/null || systemctl restart crond &>/dev/null || true
         fi
         
@@ -988,140 +1225,173 @@ do_uninstall() {
 # 4. 修改配置
 # ============================================================
 do_modify() {
-    clear
-    echo ""
-    hr
-    echo -e "  ${BOLD}${C} 修改配置${NC}"
-    hr
-    echo ""
-
     auto_select_or_ask_version "修改配置" || return
 
-    if ! parse_config; then
-        err "配置文件不存在"
-        pause
-        return
-    fi
+    while true; do
+        clear
+        echo ""
+        hr
+        echo -e "  ${BOLD}${C} 修改配置 (Snell ${SUFFIX})${NC}"
+        hr
+        echo ""
 
-    if [[ -z "$CUR_PORT" || ! "$CUR_PORT" =~ ^[0-9]+$ ]]; then
-        err "错误: 无法解析当前端口号，配置文件可能损坏！"
-        pause
-        return
-    fi
-
-    local config_file
-    config_file=$(get_config_file)
-
-    echo -e "  ${G}1${NC}. 端口    ${DIM}当前: ${CUR_PORT}${NC}"
-    echo -e "  ${G}2${NC}. PSK     ${DIM}当前: ${CUR_PSK}${NC}"
-    echo -e "  ${G}3${NC}. IPv6    ${DIM}当前: ${CUR_IPV6:-true}${NC}"
-    echo -e "  ${G}4${NC}. TFO     ${DIM}当前: ${CUR_TFO:-false}${NC}"
-    echo -e "  ${G}5${NC}. DNS     ${DIM}当前: ${CUR_DNS:-未设置}${NC}"
-    echo -e "  ${G}6${NC}. 重新生成随机 PSK"
-    echo ""
-    echo -e "  ${DIM}0. 返回${NC}"
-    echo ""
-    read -rp "  选择 [0-6]: " mc
-
-    # 输入非数字或者越界保护
-    if [[ ! "$mc" =~ ^[0-9]+$ ]] || [[ "$mc" -lt 1 || "$mc" -gt 6 ]]; then
-        return
-    fi
-
-    local other_port=""
-    other_port=$(get_other_port)
-
-    case "$mc" in
-        1)
-            read -rp "  新端口: " np
-            [[ -n "$np" ]] || { warn "未输入"; pause; return; }
-            if ! validate_port "$np"; then
-                pause
-                return
-            fi
-            if [[ -n "$other_port" && "$np" == "$other_port" ]]; then
-                local other_suffix="v5"
-                [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
-                err "错误: 新端口与已安装的 Snell ${other_suffix} 端口 (${other_port}) 冲突！"
-                pause
-                return
-            fi
-            if port_in_use "$np"; then
-                err "错误: 端口 ${np} 已被系统其他服务占用，请更换端口！"
-                pause
-                return
-            fi
-            close_firewall "$CUR_PORT"
-            if [[ "${CUR_IPV6}" == "true" ]]; then
-                sed -i "s|^listen\s*=.*|listen = [::]:${np}|" "$config_file"
-            else
-                sed -i "s|^listen\s*=.*|listen = 0.0.0.0:${np}|" "$config_file"
-            fi
-            open_firewall "$np"
-            ok "端口 -> ${np}"
-            ;;
-        2)
-            read -rp "  新 PSK: " nk
-            [[ -n "$nk" ]] || { warn "未输入"; pause; return; }
-            sed -i "s|^psk\s*=.*|psk = ${nk}|" "$config_file"
-            ok "PSK 已修改"
-            ;;
-        3)
-            local nv
-            if [[ "${CUR_IPV6}" == "true" ]]; then
-                nv="false"
-                sed -i "s|^listen\s*=.*|listen = 0.0.0.0:${CUR_PORT}|" "$config_file"
-            else
-                nv="true"
-                sed -i "s|^listen\s*=.*|listen = [::]:${CUR_PORT}|" "$config_file"
-            fi
-            if grep -q "^ipv6\s*=" "$config_file"; then
-                sed -i "s|^ipv6\s*=.*|ipv6 = ${nv}|" "$config_file"
-            else
-                echo "ipv6 = ${nv}" >> "$config_file"
-            fi
-            ok "IPv6 -> ${nv}"
-            ;;
-        4)
-            local nt
-            [[ "${CUR_TFO}" == "true" ]] && nt="false" || nt="true"
-            if grep -q "^tfo" "$config_file"; then
-                sed -i "s|^tfo\s*=.*|tfo = ${nt}|" "$config_file"
-            else
-                echo "tfo = ${nt}" >> "$config_file"
-            fi
-            apply_tfo "$nt"
-            ok "TFO -> ${nt}"
-            ;;
-        5)
-            read -rp "  新 DNS (逗号分隔): " nd
-            [[ -n "$nd" ]] || { warn "未输入"; pause; return; }
-            if grep -q "^dns" "$config_file"; then
-                sed -i "s|^dns\s*=.*|dns = ${nd}|" "$config_file"
-            else
-                echo "dns = ${nd}" >> "$config_file"
-            fi
-            ok "DNS 已修改"
-            ;;
-        6)
-            local nk
-            nk=$(random_psk)
-            sed -i "s|^psk\s*=.*|psk = ${nk}|" "$config_file"
-            ok "新 PSK: ${nk}"
-            ;;
-        *)
+        if ! parse_config; then
+            err "配置文件不存在"
+            pause
             return
-            ;;
-    esac
+        fi
 
-    echo ""
-    read -rp "  立即重启 Snell ${SUFFIX} 使配置生效? (Y/n) " rr
-    if [[ "$rr" != "n" && "$rr" != "N" ]]; then
-        local service_name
-        service_name=$(get_service_name)
-        systemctl restart "$service_name" && ok "已重启" || err "重启失败"
-    fi
-    pause
+        if [[ -z "$CUR_PORT" || ! "$CUR_PORT" =~ ^[0-9]+$ ]]; then
+            err "错误: 无法解析当前端口号，配置文件可能损坏！"
+            pause
+            return
+        fi
+
+        local config_file
+        config_file=$(get_config_file)
+
+        echo -e "  ${G}1${NC}. 端口    ${DIM}当前: ${CUR_PORT}${NC}"
+        echo -e "  ${G}2${NC}. PSK     ${DIM}当前: ${CUR_PSK}${NC}"
+        echo -e "  ${G}3${NC}. IPv6    ${DIM}当前: ${CUR_IPV6:-true}${NC}"
+        echo -e "  ${G}4${NC}. TFO     ${DIM}当前: ${CUR_TFO:-false}${NC}"
+        echo -e "  ${G}5${NC}. DNS     ${DIM}当前: ${CUR_DNS:-未设置}${NC}"
+        echo -e "  ${G}6${NC}. 重新生成随机 PSK"
+        echo ""
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo ""
+        
+        local mc
+        read -rp "  选择 [0-6]: " mc
+        mc="${mc:-0}"
+
+        if [[ "$mc" == "0" ]]; then
+            return
+        fi
+
+        if [[ ! "$mc" =~ ^[0-9]+$ ]] || (( mc < 1 || mc > 6 )); then
+            warn "无效选项，请重新选择"
+            sleep 0.5
+            continue
+        fi
+
+        local other_port=""
+        other_port=$(get_other_port)
+        local has_changed=false
+
+        case "$mc" in
+            1)
+                read -rp "  新端口: " np
+                if [[ -n "$np" ]]; then
+                    if ! validate_port "$np"; then
+                        pause
+                        continue
+                    fi
+                    if [[ -n "$other_port" && "$np" == "$other_port" ]]; then
+                        local other_suffix="v5"
+                        [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
+                        err "错误: 新端口与已安装的 Snell ${other_suffix} 端口 (${other_port}) 冲突！"
+                        pause
+                        continue
+                    fi
+                    if port_in_use "$np"; then
+                        err "错误: 端口 ${np} 已被系统其他服务占用，请更换端口！"
+                        pause
+                        continue
+                    fi
+                    close_firewall "$CUR_PORT"
+                    clear_traffic_iptables "$CUR_PORT"
+                    if [[ "${CUR_IPV6}" == "true" ]]; then
+                        sed -i "s|^listen\s*=.*|listen = [::]:${np}|" "$config_file"
+                    else
+                        sed -i "s|^listen\s*=.*|listen = 0.0.0.0:${np}|" "$config_file"
+                    fi
+                    open_firewall "$np"
+                    setup_traffic_iptables "$np"
+                    ok "端口 -> ${np}"
+                    has_changed=true
+                else
+                    warn "未输入，端口未修改"
+                    pause
+                fi
+                ;;
+            2)
+                read -rp "  新 PSK: " nk
+                if [[ -n "$nk" ]]; then
+                    sed -i "s|^psk\s*=.*|psk = ${nk}|" "$config_file"
+                    ok "PSK 已修改"
+                    has_changed=true
+                else
+                    warn "未输入，PSK 未修改"
+                    pause
+                fi
+                ;;
+            3)
+                local nv
+                if [[ "${CUR_IPV6}" == "true" ]]; then
+                    nv="false"
+                    sed -i "s|^listen\s*=.*|listen = 0.0.0.0:${CUR_PORT}|" "$config_file"
+                else
+                    nv="true"
+                    sed -i "s|^listen\s*=.*|listen = [::]:${CUR_PORT}|" "$config_file"
+                fi
+                if grep -q "^ipv6\s*=" "$config_file"; then
+                    sed -i "s|^ipv6\s*=.*|ipv6 = ${nv}|" "$config_file"
+                else
+                    echo "ipv6 = ${nv}" >> "$config_file"
+                fi
+                ok "IPv6 -> ${nv}"
+                has_changed=true
+                ;;
+            4)
+                local nt
+                [[ "${CUR_TFO}" == "true" ]] && nt="false" || nt="true"
+                if grep -q "^tfo" "$config_file"; then
+                    sed -i "s|^tfo\s*=.*|tfo = ${nt}|" "$config_file"
+                else
+                    echo "tfo = ${nt}" >> "$config_file"
+                fi
+                apply_tfo "$nt"
+                ok "TFO -> ${nt}"
+                has_changed=true
+                ;;
+            5)
+                read -rp "  新 DNS (逗号分隔): " nd
+                if [[ -n "$nd" ]]; then
+                    if grep -q "^dns" "$config_file"; then
+                        sed -i "s|^dns\s*=.*|dns = ${nd}|" "$config_file"
+                    else
+                        echo "dns = ${nd}" >> "$config_file"
+                    fi
+                    ok "DNS 已修改"
+                    has_changed=true
+                else
+                    warn "未输入，DNS 未修改"
+                    pause
+                fi
+                ;;
+            6)
+                local nk
+                nk=$(random_psk)
+                sed -i "s|^psk\s*=.*|psk = ${nk}|" "$config_file"
+                ok "新 PSK 已自动生成为: ${nk}"
+                has_changed=true
+                ;;
+        esac
+
+        if [[ "$has_changed" == "true" ]]; then
+            echo ""
+            read -rp "  是否立即重启 Snell ${SUFFIX} 使配置生效? (Y/n) " rr
+            rr="${rr:-Y}"
+            if [[ "$rr" == "y" || "$rr" == "Y" ]]; then
+                local service_name
+                service_name=$(get_service_name)
+                systemctl restart "$service_name" && ok "服务已成功重启并应用新配置" || err "重启服务失败"
+            else
+                info "配置已修改，将在下次手动重启服务后生效"
+            fi
+            pause
+        fi
+    done
 }
 
 # ============================================================
@@ -1363,6 +1633,342 @@ do_logs() {
     trap - INT
     echo ""
     pause
+}
+
+# ============================================================
+# 7.5. 流量统计
+# ============================================================
+do_traffic_menu() {
+    local old_sfx="$SUFFIX"
+    while true; do
+        clear
+        echo ""
+        hr
+        echo -e "  ${BOLD}${C} ❯ SNELL 流量监控面板${NC}"
+        hr
+        echo ""
+        
+        SUFFIX="v5"
+        sync_traffic_to_db
+        local v5_bin="${INSTALL_DIR}/snell-server-v5"
+        local v5_ver="N/A"
+        [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
+        local db_v5
+        db_v5=$(get_traffic_db)
+        local v5_in v5_out v5_reset v5_auto v5_day v5_hour v5_min
+        v5_in=$(read_db_val "$db_v5" "IN_BYTES" "0")
+        v5_out=$(read_db_val "$db_v5" "OUT_BYTES" "0")
+        v5_reset=$(read_db_val "$db_v5" "LAST_RESET" "\"N/A\"")
+        v5_auto=$(read_db_val "$db_v5" "AUTO_RESET" "false")
+        v5_day=$(read_db_val "$db_v5" "RESET_DAY" "1")
+        v5_hour=$(read_db_val "$db_v5" "RESET_HOUR" "0")
+        v5_min=$(read_db_val "$db_v5" "RESET_MIN" "0")
+        
+        local v5_rule
+        if [[ "$v5_auto" == "true" ]]; then
+            v5_rule="每月 $(printf "%02d" "$v5_day") 号 $(printf "%02d" "$v5_hour"):$(printf "%02d" "$v5_min") ${G}(已开启)${NC}"
+        else
+            v5_rule="${DIM}未启用${NC}"
+        fi
+        
+        SUFFIX="v6"
+        sync_traffic_to_db
+        local v6_bin="${INSTALL_DIR}/snell-server-v6"
+        local v6_ver="N/A"
+        [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
+        local db_v6
+        db_v6=$(get_traffic_db)
+        local v6_in v6_out v6_reset v6_auto v6_day v6_hour v6_min
+        v6_in=$(read_db_val "$db_v6" "IN_BYTES" "0")
+        v6_out=$(read_db_val "$db_v6" "OUT_BYTES" "0")
+        v6_reset=$(read_db_val "$db_v6" "LAST_RESET" "\"N/A\"")
+        v6_auto=$(read_db_val "$db_v6" "AUTO_RESET" "false")
+        v6_day=$(read_db_val "$db_v6" "RESET_DAY" "1")
+        v6_hour=$(read_db_val "$db_v6" "RESET_HOUR" "0")
+        v6_min=$(read_db_val "$db_v6" "RESET_MIN" "0")
+        
+        local v6_rule
+        if [[ "$v6_auto" == "true" ]]; then
+            v6_rule="每月 $(printf "%02d" "$v6_day") 号 $(printf "%02d" "$v6_hour"):$(printf "%02d" "$v6_min") ${G}(已开启)${NC}"
+        else
+            v6_rule="${DIM}未启用${NC}"
+        fi
+        
+        SUFFIX="$old_sfx"
+        
+        if [[ -f "$v5_bin" ]]; then
+            echo -e "  ${BOLD}Snell (${v5_ver}) 流量数据:${NC}"
+            echo -e "  ${DIM}──${NC} 入站流量 (下载) : ${BOLD}$(format_bytes "$v5_in")${NC}"
+            echo -e "  ${DIM}──${NC} 出站流量 (上传) : ${BOLD}$(format_bytes "$v5_out")${NC}"
+            echo -e "  ${DIM}──${NC} 累计总流量      : ${G}${BOLD}$(format_bytes $(( v5_in + v5_out )))${NC}"
+            echo -e "  ${DIM}──${NC} 自动重置规则    : ${v5_rule}"
+            echo -e "  ${DIM}──${NC} 上次重置时间    : ${v5_reset}"
+        else
+            echo -e "  ${BOLD}Snell V5${NC}: ${DIM}未安装${NC}"
+        fi
+        echo ""
+        
+        if [[ -f "$v6_bin" ]]; then
+            echo -e "  ${BOLD}Snell (${v6_ver}) 流量数据:${NC}"
+            echo -e "  ${DIM}──${NC} 入站流量 (下载) : ${BOLD}$(format_bytes "$v6_in")${NC}"
+            echo -e "  ${DIM}──${NC} 出站流量 (上传) : ${BOLD}$(format_bytes "$v6_out")${NC}"
+            echo -e "  ${DIM}──${NC} 累计总流量      : ${G}${BOLD}$(format_bytes $(( v6_in + v6_out )))${NC}"
+            echo -e "  ${DIM}──${NC} 自动重置规则    : ${v6_rule}"
+            echo -e "  ${DIM}──${NC} 上次重置时间    : ${v6_reset}"
+        else
+            echo -e "  ${BOLD}Snell V6${NC}: ${DIM}未安装${NC}"
+        fi
+        echo ""
+        
+        hr
+        echo ""
+        echo -e "  ${G}1${NC}. 手动重置 Snell v5 流量统计"
+        echo -e "  ${G}2${NC}. 手动重置 Snell v6 流量统计"
+        echo -e "  ${G}3${NC}. 配置自动重置规则"
+        echo ""
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo ""
+        
+        local choice
+        read -rp "  请选择 [0-3]: " choice
+        case "$choice" in
+            1)
+                if [[ ! -f "$v5_bin" ]]; then
+                    err "Snell V5 未安装"; pause; continue
+                fi
+                local confirm_reset
+                read -rp "  确认清零 Snell V5 流量统计吗？(Y/n) " confirm_reset
+                confirm_reset="${confirm_reset:-Y}"
+                if [[ "$confirm_reset" == "y" || "$confirm_reset" == "Y" ]]; then
+                    SUFFIX="v5"
+                    reset_single_traffic "v5"
+                    SUFFIX="$old_sfx"
+                    ok "Snell V5 流量统计已重置"
+                    pause
+                fi
+                ;;
+            2)
+                if [[ ! -f "$v6_bin" ]]; then
+                    err "Snell V6 未安装"; pause; continue
+                fi
+                local confirm_reset
+                read -rp "  确认清零 Snell V6 流量统计吗？(Y/n) " confirm_reset
+                confirm_reset="${confirm_reset:-Y}"
+                if [[ "$confirm_reset" == "y" || "$confirm_reset" == "Y" ]]; then
+                    SUFFIX="v6"
+                    reset_single_traffic "v6"
+                    SUFFIX="$old_sfx"
+                    ok "Snell V6 流量统计已重置"
+                    pause
+                fi
+                ;;
+            3)
+                local sel_ver=""
+                if [[ -f "$v5_bin" && -f "$v6_bin" ]]; then
+                    echo ""
+                    echo -e "  请选择要修改自动重置规则的 Snell 版本:"
+                    echo -e "  ${G}1${NC}. Snell (${v5_ver})"
+                    echo -e "  ${G}2${NC}. Snell (${v6_ver})"
+                    echo -e "  ${G}0${NC}. 返回"
+                    echo ""
+                    local choice_ver
+                    read -rp "  请选择 [1/2/0]: " choice_ver
+                    case "$choice_ver" in
+                        2) sel_ver="v6" ;;
+                        0) SUFFIX="$old_sfx"; continue ;;
+                        *) sel_ver="v5" ;;
+                    esac
+                elif [[ -f "$v5_bin" ]]; then
+                    sel_ver="v5"
+                elif [[ -f "$v6_bin" ]]; then
+                    sel_ver="v6"
+                else
+                    err "未检测到已安装的 Snell"; pause; continue
+                fi
+                
+                SUFFIX="$sel_ver"
+                local db_file
+                db_file=$(get_traffic_db)
+                
+                local current_auto
+                current_auto=$(read_db_val "$db_file" "AUTO_RESET" "false")
+                
+                local opt_auto
+                read -rp "  是否启用每月自动重置？(当前: ${current_auto}) [Y/n]: " opt_auto
+                opt_auto="${opt_auto:-Y}"
+                if [[ "$opt_auto" == "y" || "$opt_auto" == "Y" ]]; then
+                    write_db_val "$db_file" "AUTO_RESET" "true"
+                    
+                    local cur_day
+                    cur_day=$(read_db_val "$db_file" "RESET_DAY" "1")
+                    
+                    local sys_year sys_month sys_max_days
+                    sys_year=$(date +%Y)
+                    sys_month=$(date +%m)
+                    case "$((10#$sys_month))" in
+                        1|3|5|7|8|10|12) sys_max_days=31 ;;
+                        4|6|9|11) sys_max_days=30 ;;
+                        2)
+                            local y=$((10#$sys_year))
+                            if (( (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 )); then
+                                sys_max_days=29
+                            else
+                                sys_max_days=28
+                            fi
+                            ;;
+                        *) sys_max_days=30 ;;
+                    esac
+                    
+                    echo -e "  系统当前时间为 ${sys_year}年${sys_month}月，本月共有 ${sys_max_days} 天。"
+                    
+                    local opt_day
+                    read -rp "  请输入每月重置的日期 [1-31, 当前: ${cur_day}]: " opt_day
+                    opt_day="${opt_day:-$cur_day}"
+                    if [[ ! "$opt_day" =~ ^[0-9]+$ ]] || (( opt_day < 1 || opt_day > 31 )); then
+                        warn "输入日期无效，回滚为默认值 1"
+                        opt_day="1"
+                    fi
+                    write_db_val "$db_file" "RESET_DAY" "$opt_day"
+                    
+                    local cur_hour cur_min cur_time
+                    cur_hour=$(read_db_val "$db_file" "RESET_HOUR" "0")
+                    cur_min=$(read_db_val "$db_file" "RESET_MIN" "0")
+                    cur_time=$(printf "%02d:%02d" "$cur_hour" "$cur_min")
+                    
+                    local opt_time
+                    read -rp "  请输入重置的具体时间 (格式如 08:30, 当前: ${cur_time}): " opt_time
+                    opt_time="${opt_time:-$cur_time}"
+                    
+                    if [[ "$opt_time" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+                        local h="${BASH_REMATCH[1]}"
+                        local m="${BASH_REMATCH[2]}"
+                        if (( h >= 0 && h <= 23 && m >= 0 && m <= 59 )); then
+                            write_db_val "$db_file" "RESET_HOUR" "$h"
+                            write_db_val "$db_file" "RESET_MIN" "$m"
+                            ok "自动重置时间已设置为 每月 ${opt_day} 号 ${opt_time}"
+                        else
+                            warn "小时或分钟数值超出范围，回滚为默认 00:00"
+                            write_db_val "$db_file" "RESET_HOUR" "0"
+                            write_db_val "$db_file" "RESET_MIN" "0"
+                        fi
+                    else
+                        warn "时间格式不匹配 (HH:MM)，回滚为默认 00:00"
+                        write_db_val "$db_file" "RESET_HOUR" "0"
+                        write_db_val "$db_file" "RESET_MIN" "0"
+                    fi
+                else
+                    write_db_val "$db_file" "AUTO_RESET" "false"
+                    ok "已禁用每月自动重置"
+                fi
+                
+                deploy_traffic_cron &>/dev/null
+                SUFFIX="$old_sfx"
+                pause
+                ;;
+            0)
+                break
+                ;;
+        esac
+    done
+}
+
+sync_all_traffic() {
+    local old_sfx="$SUFFIX"
+    local v5_bin="${INSTALL_DIR}/snell-server-v5"
+    local v6_bin="${INSTALL_DIR}/snell-server-v6"
+    if [[ -f "$v5_bin" ]]; then
+        SUFFIX="v5"
+        sync_traffic_to_db &>/dev/null
+    fi
+    if [[ -f "$v6_bin" ]]; then
+        SUFFIX="v6"
+        sync_traffic_to_db &>/dev/null
+    fi
+    SUFFIX="$old_sfx"
+    return 0
+}
+
+reset_single_traffic() {
+    local sfx="$1"
+    local old_sfx="$SUFFIX"
+    SUFFIX="$sfx"
+    
+    local dbf
+    dbf=$(get_traffic_db)
+    write_db_val "$dbf" "IN_BYTES" "0"
+    write_db_val "$dbf" "OUT_BYTES" "0"
+    write_db_val "$dbf" "LAST_RAW_IN" "0"
+    write_db_val "$dbf" "LAST_RAW_OUT" "0"
+    write_db_val "$dbf" "LAST_RESET" "\"$(date '+%Y-%m-%d %H:%M:%S')\""
+    
+    local port
+    port=$(grep -E "^listen\s*=" "${CONFIG_DIR}/snell-server-${SUFFIX}.conf" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+    if [[ -n "$port" ]]; then
+        clear_traffic_iptables "$port" "true" &>/dev/null
+        setup_traffic_iptables "$port" &>/dev/null
+    fi
+    
+    SUFFIX="$old_sfx"
+    return 0
+}
+
+reset_all_traffic() {
+    local v5_bin="${INSTALL_DIR}/snell-server-v5"
+    local v6_bin="${INSTALL_DIR}/snell-server-v6"
+    if [[ -f "$v5_bin" ]]; then
+        reset_single_traffic "v5"
+        ok "Snell v5 流量统计已重置！"
+    fi
+    if [[ -f "$v6_bin" ]]; then
+        reset_single_traffic "v6"
+        ok "Snell v6 流量统计已重置！"
+    fi
+    return 0
+}
+
+deploy_traffic_cron() {
+    command -v cron &>/dev/null || command -v crond &>/dev/null || return 0
+    [[ -f /etc/crontab ]] || return 0
+    
+    sed -i '/--traffic-sync/d; /--traffic-reset/d' /etc/crontab 2>/dev/null || true
+    
+    local v5_bin="${INSTALL_DIR}/snell-server-v5"
+    local v6_bin="${INSTALL_DIR}/snell-server-v6"
+    if [[ -f "$v5_bin" || -f "$v6_bin" ]]; then
+        sed -i '$a\\' /etc/crontab 2>/dev/null || true
+        echo "*/5 * * * * root /usr/local/bin/snell --traffic-sync &>/dev/null" >> /etc/crontab 2>/dev/null || true
+    fi
+    
+    if [[ -f "$v5_bin" ]]; then
+        local db_v5
+        db_v5="${CONFIG_DIR}/traffic-v5.db"
+        local auto_reset reset_day reset_hour reset_min
+        auto_reset=$(read_db_val "$db_v5" "AUTO_RESET" "false")
+        if [[ "$auto_reset" == "true" ]]; then
+            reset_day=$(read_db_val "$db_v5" "RESET_DAY" "1")
+            reset_hour=$(read_db_val "$db_v5" "RESET_HOUR" "0")
+            reset_min=$(read_db_val "$db_v5" "RESET_MIN" "0")
+            sed -i '$a\\' /etc/crontab 2>/dev/null || true
+            echo "${reset_min} ${reset_hour} ${reset_day} * * root /usr/local/bin/snell --traffic-reset-v5 &>/dev/null" >> /etc/crontab 2>/dev/null || true
+        fi
+    fi
+    
+    if [[ -f "$v6_bin" ]]; then
+        local db_v6
+        db_v6="${CONFIG_DIR}/traffic-v6.db"
+        local auto_reset reset_day reset_hour reset_min
+        auto_reset=$(read_db_val "$db_v6" "AUTO_RESET" "false")
+        if [[ "$auto_reset" == "true" ]]; then
+            reset_day=$(read_db_val "$db_v6" "RESET_DAY" "1")
+            reset_hour=$(read_db_val "$db_v6" "RESET_HOUR" "0")
+            reset_min=$(read_db_val "$db_v6" "RESET_MIN" "0")
+            sed -i '$a\\' /etc/crontab 2>/dev/null || true
+            echo "${reset_min} ${reset_hour} ${reset_day} * * root /usr/local/bin/snell --traffic-reset-v6 &>/dev/null" >> /etc/crontab 2>/dev/null || true
+        fi
+    fi
+    
+    systemctl restart cron &>/dev/null || systemctl restart crond &>/dev/null || true
+    return 0
 }
 
 # ============================================================
@@ -1875,6 +2481,24 @@ main() {
         exit 0
     fi
     
+    # 支持后台流量同步与重置参数
+    if [[ "${1:-}" == "--traffic-sync" ]]; then
+        sync_all_traffic
+        exit 0
+    fi
+    if [[ "${1:-}" == "--traffic-reset" ]]; then
+        reset_all_traffic
+        exit 0
+    fi
+    if [[ "${1:-}" == "--traffic-reset-v5" ]]; then
+        reset_single_traffic "v5" &>/dev/null
+        exit 0
+    fi
+    if [[ "${1:-}" == "--traffic-reset-v6" ]]; then
+        reset_single_traffic "v6" &>/dev/null
+        exit 0
+    fi
+    
     clear
     echo ""
     hr
@@ -1895,9 +2519,33 @@ main() {
     install_shortcut
     sleep 0.2
     
+    # 部署或修复自动流量统计与清零任务
+    deploy_traffic_cron &>/dev/null
+    
+    # 启动时自动静默修复/补全正在运行服务的防火墙规则和流量统计规则
+    local v5_port_chk v6_port_chk
+    if systemctl is-active --quiet snell-v5 2>/dev/null; then
+        v5_port_chk=$(grep -E "^listen\s*=" "${CONFIG_DIR}/snell-server-v5.conf" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+        if [[ -n "$v5_port_chk" ]]; then
+            local orig_sfx="$SUFFIX"
+            SUFFIX="v5"
+            setup_traffic_iptables "$v5_port_chk" &>/dev/null
+            SUFFIX="$orig_sfx"
+        fi
+    fi
+    if systemctl is-active --quiet snell-v6 2>/dev/null; then
+        v6_port_chk=$(grep -E "^listen\s*=" "${CONFIG_DIR}/snell-server-v6.conf" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+        if [[ -n "$v6_port_chk" ]]; then
+            local orig_sfx="$SUFFIX"
+            SUFFIX="v6"
+            setup_traffic_iptables "$v6_port_chk" &>/dev/null
+            SUFFIX="$orig_sfx"
+        fi
+    fi
+    
     while true; do
         show_menu
-        read -rp "  选择 [0-11]: " ch
+        read -rp "  选择 [0-12]: " ch
         case "$ch" in
             1) do_install ;;
             2) do_update ;;
@@ -1910,6 +2558,7 @@ main() {
             9) do_sync_time ;;
             10) do_cron_menu ;;
             11) update_self ;;
+            12) do_traffic_menu ;;
             0) echo ""; info "再见"; echo ""; exit 0 ;;
             *) warn "无效选项"; sleep 0.3 ;;
         esac
