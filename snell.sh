@@ -130,8 +130,13 @@ die()     { err "$*"; exit 1; }
 hr() { printf "  ${DIM}"; printf '%.s─' {1..48}; printf "${NC}\n"; }
 dhr() { printf "  ${DIM}"; printf '%.s┈' {1..48}; printf "${NC}\n"; }
 
+clear_stdin() {
+    while read -t 0.01 -n 100000; do :; done 2>/dev/null || true
+}
+
 pause() {
     echo ""
+    clear_stdin
     read -rsn1 -p "  按任意键返回主菜单..."
     echo ""
 }
@@ -671,6 +676,9 @@ do_install() {
     hr
     echo ""
 
+    # 声明全部局部变量以避免 set -u 触发 nounset 错误退出
+    local vc="" ow="" ip="" ik="" i6="" it="" ie="" id="" cf=""
+
     detect_arch
     ensure_deps
     
@@ -698,8 +706,10 @@ do_install() {
     if [[ -f "$bin_path" ]]; then
         is_installed=true
         warn "已检测到已安装的 Snell Server ${SUFFIX}"
-        read -rp "  覆盖安装？(y/N) " ow
-        [[ "$ow" == "y" || "$ow" == "Y" ]] || { info "已取消"; pause; return; }
+        clear_stdin
+        read -rp "  覆盖安装？(Y/n) [默认 Y]: " ow
+        local ow_val="${ow:-y}"
+        [[ "$ow_val" == "y" || "$ow_val" == "Y" ]] || { info "已取消"; pause; return; }
         echo ""
         parse_config &>/dev/null || true
     fi
@@ -813,8 +823,10 @@ do_install() {
     echo -e "  DNS  ......  ${BOLD}${dns}${NC}"
     echo -e "  UDP  ......  ${BOLD}启用${NC}"
     echo ""
-    read -rp "  确认安装? (Y/n) " cf
-    [[ "$cf" == "n" || "$cf" == "N" ]] && { info "已取消"; pause; return; }
+    clear_stdin
+    read -rp "  确认安装? (Y/n) [默认 Y]: " cf
+    local cf_val="${cf:-y}"
+    [[ "$cf_val" == "n" || "$cf_val" == "N" ]] && { info "已取消"; pause; return; }
 
     echo ""
     hr
@@ -1779,11 +1791,22 @@ do_sync_time() {
         pacman -Sy --noconfirm chrony
     fi
 
-    info "写入高精度国内大厂 NTP 授时源 (阿里/腾讯/国家授时中心)..."
+    # 检测 IP 归属地，决定最优 NTP 服务器配置
+    local country=""
+    info "正在检测当前主机的公网 IP 归属以配置最优 NTP 服务器..."
+    country=$(curl -sL --max-time 3 https://ipinfo.io/country | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)
+    if [[ -z "$country" ]]; then
+        country=$(curl -sL --max-time 3 https://ipapi.co/country/ | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)
+    fi
+
     local chrony_conf="/etc/chrony.conf"
     [[ -d /etc/chrony ]] && chrony_conf="/etc/chrony/chrony.conf"
-    cat <<EOF > "$chrony_conf"
-server ntp.aliyun.com iburst
+
+    if [[ "$country" == "CN" ]]; then
+        ok "检测到当前主机为中国大陆 IP (${country})，配置国内高精度源..."
+        cat <<EOF > "$chrony_conf"
+# 国内机器最优授时源
+server ntp.aliyun.com iburst prefer
 server ntp.tencent.com iburst
 server ntp.ntsc.ac.cn iburst
 driftfile /var/lib/chrony/chrony.drift
@@ -1792,6 +1815,22 @@ maxupdateskew 100.0
 rtcsync
 makestep 1.0 -1
 EOF
+    else
+        ok "检测到当前主机为海外 IP (${country:-未知})，配置全球任播 Anycast 授时源..."
+        cat <<EOF > "$chrony_conf"
+# 海外/美国机器最优全球任播源
+server time.google.com iburst prefer
+server time.cloudflare.com iburst
+server time.apple.com iburst
+# 备用国内高精度大厂源
+server ntp.aliyun.com iburst
+driftfile /var/lib/chrony/chrony.drift
+logdir /var/log/chrony
+maxupdateskew 100.0
+rtcsync
+makestep 1.0 -1
+EOF
+    fi
 
     # 8. 启动与配置 Chrony 服务并强制对时
     info "4/4. 启动并配置 chrony 自动对时服务..."
@@ -1804,13 +1843,23 @@ EOF
 
     systemctl enable "$svc_name" &>/dev/null || true
     systemctl restart "$svc_name" &>/dev/null || true
-    sleep 1
+    sleep 2
     
     # 显式让 systemd 允许网络对时，并立即执行步进校准
     timedatectl set-ntp true 2>/dev/null || true
     chronyc -a makestep &>/dev/null || true
 
     ok "时间深度同步与冲突清理完成！"
+    
+    # 尝试获取并打印当前时间偏差值 (System time offset)
+    local offset=""
+    if command -v chronyc &>/dev/null; then
+        offset=$(chronyc tracking 2>/dev/null | grep -i "System time" | sed -E 's/^[[:space:]]+//' || true)
+    fi
+    if [[ -n "$offset" ]]; then
+        info "对时偏差精度: ${offset}"
+    fi
+
     echo -e "  系统当前时间: $(date)"
     echo ""
     pause
