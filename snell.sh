@@ -84,7 +84,7 @@ fetch_latest_versions() {
     if [[ -n "$html" ]]; then
         # 1. 动态探测并校验 V6 可下载最新版 (测试前 5 个候选版本)
         local v6_candidates
-        v6_candidates=$(echo "$html" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | sort -u -r | head -n 5 || true)
+        v6_candidates=$(echo "$html" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | sort -V -r | head -n 5 || true)
         for candidate in $v6_candidates; do
             if check_url_exists "$candidate"; then
                 V6_VERSION="$candidate"
@@ -94,7 +94,7 @@ fetch_latest_versions() {
 
         # 2. 动态探测并校验 V5 可下载最新版 (测试前 5 个候选版本)
         local v5_candidates
-        v5_candidates=$(echo "$html" | grep -oE 'v5\.[0-9]+\.[0-9]+' | sort -u -r | head -n 5 || true)
+        v5_candidates=$(echo "$html" | grep -oE 'v5\.[0-9]+\.[0-9]+' | sort -V -r | head -n 5 || true)
         for candidate in $v5_candidates; do
             if check_url_exists "$candidate"; then
                 V5_VERSION="$candidate"
@@ -143,26 +143,22 @@ install_shortcut() {
     local script_dest="/usr/local/bin/snell"
     local github_url="https://raw.githubusercontent.com/hann0w0/snell-install/main/snell.sh"
     
-    # 清理旧版本遗留的缓存与软链接
+    # 清理旧版本遗留的软链接
     if [[ -L "$script_dest" ]]; then
         rm -f "$script_dest" 2>/dev/null || true
     fi
-    if [[ -f "/root/snell.sh" ]]; then
-        rm -f "/root/snell.sh" 2>/dev/null || true
-    fi
     
-    # 检查当前运行的脚本是否已经是目标路径。如果是，说明已经是本地安装的版本在运行，无需重复下载/拷贝
+    # 检查当前运行的脚本是否已经是目标路径
     local cur_real_path
     cur_real_path=$(readlink -f "$0" 2>/dev/null || echo "")
     if [[ "$cur_real_path" == "$script_dest" ]]; then
         return 0
     fi
     
-    # 否则，我们需要将脚本部署到目标路径
     info "正在为您配置本地快捷调用指令 'snell'..."
     
     local success=false
-    # 场景 1：如果是通过本地普通文件运行 (如 ./snell.sh)，且不是管道或系统 shell 二进制
+    # 场景 1：如果本地有运行中的普通文件，直接 cp
     local base_name
     base_name=$(basename "$cur_real_path" 2>/dev/null || echo "")
     if [[ -f "$0" ]] && [[ "$base_name" != "bash" && "$base_name" != "sh" && "$base_name" != "zsh" && "$cur_real_path" != *"/dev/fd/"* ]]; then
@@ -171,7 +167,7 @@ install_shortcut() {
         fi
     fi
     
-    # 场景 2：如果是通过网络管道一键运行 (如 curl | bash)，我们直接从 github 拉取最新版本并写入目标路径
+    # 场景 2：如果是网络管道运行，从 GitHub 拉取
     if [[ "$success" == "false" ]]; then
         if command -v curl &>/dev/null; then
             curl -fsSL --connect-timeout 5 "$github_url" > "$script_dest" 2>/dev/null && success=true
@@ -183,6 +179,11 @@ install_shortcut() {
     if [[ "$success" == "true" ]]; then
         chmod +x "$script_dest" 2>/dev/null || true
         ok "快捷指令 'snell' 部署成功！以后在终端键入 'snell' 或 'sudo snell' 即可直接启动面板。"
+        
+        # 拷贝成功后，若当前运行的不是 /root/snell.sh 且该残留存在，则清理它，防范自杀
+        if [[ "$cur_real_path" != "/root/snell.sh" && -f "/root/snell.sh" ]]; then
+            rm -f "/root/snell.sh" 2>/dev/null || true
+        fi
     else
         warn "快捷指令 'snell' 部署失败，但不影响当前面板的使用。"
     fi
@@ -413,7 +414,7 @@ get_other_port() {
     [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
     local other_cfg="${CONFIG_DIR}/snell-server-${other_suffix}.conf"
     if [[ -f "$other_cfg" ]]; then
-        grep -E "^listen\s*=" "$other_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$'
+        grep -E "^listen\s*=" "$other_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | awk -F: '{print $NF}' | tr -d '[:space:]' | grep -oE '^[0-9]+$'
     fi
 }
 
@@ -454,6 +455,7 @@ download_and_install() {
     local service_name
     service_name=$(get_service_name)
     systemctl stop "$service_name" 2>/dev/null || true
+    pkill -9 -f "snell-server-${SUFFIX}" 2>/dev/null || true
     
     local bin_path
     bin_path=$(get_bin_path)
@@ -692,11 +694,14 @@ do_install() {
     
     local bin_path
     bin_path=$(get_bin_path)
+    local is_installed=false
     if [[ -f "$bin_path" ]]; then
+        is_installed=true
         warn "已检测到已安装的 Snell Server ${SUFFIX}"
         read -rp "  覆盖安装？(y/N) " ow
         [[ "$ow" == "y" || "$ow" == "Y" ]] || { info "已取消"; pause; return; }
         echo ""
+        parse_config &>/dev/null || true
     fi
 
     ok "版本: Snell ${SUFFIX} (${sv})"
@@ -711,24 +716,23 @@ do_install() {
     [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
 
     local rp
-    rp=$(random_port)
-    while [[ -n "$other_port" && "$rp" == "$other_port" ]] || port_in_use "$rp"; do
+    if [[ "$is_installed" == "true" && -n "$CUR_PORT" ]]; then
+        rp="$CUR_PORT"
+        read -rp "  端口 [回车保持当前 ${rp}]: " ip
+    else
         rp=$(random_port)
-    done
-
-    if [[ -n "$other_port" ]]; then
-        info "提示: 另一个版本 Snell ${other_suffix} 已安装，其占用端口为: ${other_port}，请不要使用冲突的端口。"
+        while [[ -n "$other_port" && "$rp" == "$other_port" ]] || port_in_use "$rp"; do
+            rp=$(random_port)
+        done
+        read -rp "  端口 [回车随机 ${rp}]: " ip
     fi
-
-    read -rp "  端口 [回车随机 ${rp}]: " ip
     local port="${ip:-$rp}"
+
     if ! validate_port "$port"; then
         pause
         return
     fi
     if [[ -n "$other_port" && "$port" == "$other_port" ]]; then
-        local other_suffix="v5"
-        [[ "$SUFFIX" == "v5" ]] && other_suffix="v6"
         err "错误: 端口与已安装的 Snell ${other_suffix} 端口 (${other_port}) 冲突！"
         pause
         return
@@ -743,23 +747,40 @@ do_install() {
 
     # PSK
     local rpsk
-    rpsk=$(random_psk)
-    read -rp "  PSK [回车随机生成]: " ik
+    if [[ "$is_installed" == "true" && -n "$CUR_PSK" ]]; then
+        rpsk="$CUR_PSK"
+        read -rp "  PSK [回车保持当前 PSK]: " ik
+    else
+        rpsk=$(random_psk)
+        read -rp "  PSK [回车随机生成]: " ik
+    fi
     local psk="${ik:-$rpsk}"
     ok "PSK: ${psk}"
     echo ""
 
     # IPv6
-    read -rp "  监听 IPv6? (Y/n) [默认 Y]: " i6
-    local ipv6="true"
-    [[ "$i6" == "n" || "$i6" == "N" ]] && ipv6="false"
+    local def_i6="true"
+    [[ "$is_installed" == "true" && -n "$CUR_IPV6" ]] && def_i6="$CUR_IPV6"
+    local i6_prompt="Y/n"
+    [[ "$def_i6" == "false" ]] && i6_prompt="y/N"
+    read -rp "  监听 IPv6? (${i6_prompt}) [当前: ${def_i6}]: " i6
+    local ipv6="$def_i6"
+    if [[ -n "$i6" ]]; then
+        [[ "$i6" == "n" || "$i6" == "N" ]] && ipv6="false" || ipv6="true"
+    fi
     ok "IPv6: ${ipv6}"
     echo ""
 
     # TFO
-    read -rp "  TCP Fast Open? (y/N) [默认 N]: " it
-    local tfo="false"
-    [[ "$it" == "y" || "$it" == "Y" ]] && tfo="true"
+    local def_tfo="false"
+    [[ "$is_installed" == "true" && -n "$CUR_TFO" ]] && def_tfo="$CUR_TFO"
+    local tfo_prompt="y/N"
+    [[ "$def_tfo" == "true" ]] && tfo_prompt="Y/n"
+    read -rp "  TCP Fast Open? (${tfo_prompt}) [当前: ${def_tfo}]: " it
+    local tfo="$def_tfo"
+    if [[ -n "$it" ]]; then
+        [[ "$it" == "y" || "$it" == "Y" ]] && tfo="true" || tfo="false"
+    fi
     ok "TFO: ${tfo}"
     echo ""
 
@@ -772,8 +793,8 @@ do_install() {
 
     # DNS
     local ddns="1.1.1.1,8.8.8.8,2606:4700:4700::1111,2001:4860:4860::8888"
-    echo -e "  ${DIM}默认: ${ddns}${NC}"
-    read -rp "  DNS [回车默认]: " id
+    [[ "$is_installed" == "true" && -n "$CUR_DNS" ]] && ddns="$CUR_DNS"
+    read -rp "  DNS [回车保持当前]: " id
     local dns="${id:-$ddns}"
     ok "DNS: ${dns}"
 
@@ -1685,33 +1706,69 @@ do_sync_time() {
         cur_tz=$(timedatectl show 2>/dev/null | grep "Timezone=" | cut -d= -f2 || true)
     fi
     
-    # 2. 检查 chrony 或其他同步服务是否运行，且已配置好
+    # 2. 检查同步服务运行状态
     local service_active=false
-    # 动态检测 chrony 配置路径
-    local chrony_conf_check="/etc/chrony.conf"
-    [[ -d /etc/chrony ]] && chrony_conf_check="/etc/chrony/chrony.conf"
     if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet chronyd 2>/dev/null; then
-        if [[ -f "$chrony_conf_check" ]] && grep -q "ntp.aliyun.com" "$chrony_conf_check" 2>/dev/null; then
-            service_active=true
-        fi
+        service_active=true
     fi
 
-    # 如果时区和同步服务配置完毕，则直接返回
-    if [[ "$cur_tz" == "Asia/Shanghai" && "$service_active" == "true" ]]; then
-        ok "检测到系统已配置 Asia/Shanghai 时区，且 Chrony 同步正常，无需重复配置！"
+    # 3. 检查有无运行中的冲突时间同步服务
+    local conflict_detected=false
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null || systemctl is-active --quiet ntp 2>/dev/null || systemctl is-active --quiet ntpd 2>/dev/null; then
+        conflict_detected=true
+    fi
+
+    # 4. 如果时区和同步服务已经配置完毕，且没有冲突服务在运行，则无需重复配置
+    if [[ "$cur_tz" == "Asia/Shanghai" && "$service_active" == "true" && "$conflict_detected" == "false" ]]; then
+        ok "检测到系统已配置 Asia/Shanghai 时区，且时间同步服务正常，无其他冲突服务！"
         echo -e "  系统当前时间: $(date)"
         echo ""
         pause
         return
     fi
 
-    info "系统时间配置未完善，正在开始同步..."
+    # 5. 检测是否是容器环境 (LXC/OpenVZ/Docker)
+    local is_container=false
+    local virt_type=""
+    if command -v systemd-detect-virt &>/dev/null; then
+        virt_type=$(systemd-detect-virt 2>/dev/null || true)
+        if [[ "$virt_type" == "lxc" || "$virt_type" == "openvz" || "$virt_type" == "docker" || "$virt_type" == "container" ]]; then
+            is_container=true
+        fi
+    fi
+
+    info "开始系统时间深度优化与冲突排查..."
     echo ""
 
-    info "正在配置系统时区为 Asia/Shanghai..."
+    info "1/4. 固定系统时区为 Asia/Shanghai..."
     timedatectl set-timezone Asia/Shanghai 2>/dev/null || true
+
+    if [ "$is_container" = true ]; then
+        warn "检测到当前处于容器虚拟化环境 (${virt_type})，容器内无权直接修改内核系统时钟。"
+        info "时区已为您切换为 Asia/Shanghai，时钟精度将完全依赖您的宿主机环境。"
+        echo -e "  系统当前时间: $(date)"
+        echo ""
+        pause
+        return
+    fi
+
+    # 6. 自动禁用并清理冲突服务，防止端口和时钟控制权争抢
+    info "2/4. 检查并清理冲突的时间同步服务..."
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        warn "检测到冲突服务 systemd-timesyncd 正在运行，正在将其停用并禁用..."
+        systemctl disable --now systemd-timesyncd &>/dev/null || true
+    fi
+    if systemctl is-active --quiet ntp 2>/dev/null; then
+        warn "检测到冲突服务 ntp 正在运行，正在将其停用并禁用..."
+        systemctl disable --now ntp &>/dev/null || true
+    fi
+    if systemctl is-active --quiet ntpd 2>/dev/null; then
+        warn "检测到冲突服务 ntpd 正在运行，正在将其停用并禁用..."
+        systemctl disable --now ntpd &>/dev/null || true
+    fi
     
-    info "正在安装并配置 chrony..."
+    # 7. 安装与配置 Chrony
+    info "3/4. 正在安装并配置 chrony..."
     if command -v apt-get &>/dev/null; then
         apt-get update -qq && apt-get install -y chrony -qq
     elif command -v dnf &>/dev/null; then
@@ -1722,28 +1779,39 @@ do_sync_time() {
         pacman -Sy --noconfirm chrony
     fi
 
-    info "正在写入 chrony.conf 配置..."
-    # 动态检测 chrony 配置路径（Debian/Ubuntu 为 /etc/chrony/chrony.conf，CentOS/RHEL 为 /etc/chrony.conf）
+    info "写入高精度国内大厂 NTP 授时源 (阿里/腾讯/国家授时中心)..."
     local chrony_conf="/etc/chrony.conf"
     [[ -d /etc/chrony ]] && chrony_conf="/etc/chrony/chrony.conf"
     cat <<EOF > "$chrony_conf"
 server ntp.aliyun.com iburst
 server ntp.tencent.com iburst
+server ntp.ntsc.ac.cn iburst
 driftfile /var/lib/chrony/chrony.drift
 logdir /var/log/chrony
 maxupdateskew 100.0
 rtcsync
-makestep 1.0 3
+makestep 1.0 -1
 EOF
 
-    info "正在重启 chrony 服务并强制同步..."
-    if systemctl is-enabled --quiet chrony 2>/dev/null || systemctl is-enabled --quiet chronyd 2>/dev/null; then
-        systemctl restart chrony &>/dev/null || systemctl restart chronyd &>/dev/null || true
-        sleep 1
-        chronyc -a makestep &>/dev/null || true
+    # 8. 启动与配置 Chrony 服务并强制对时
+    info "4/4. 启动并配置 chrony 自动对时服务..."
+    local svc_name="chrony"
+    if ! systemctl list-unit-files | grep -q "^chrony.service" 2>/dev/null; then
+        if systemctl list-unit-files | grep -q "^chronyd.service" 2>/dev/null; then
+            svc_name="chronyd"
+        fi
     fi
 
-    ok "时间同步完成，当前系统时间: $(date)"
+    systemctl enable "$svc_name" &>/dev/null || true
+    systemctl restart "$svc_name" &>/dev/null || true
+    sleep 1
+    
+    # 显式让 systemd 允许网络对时，并立即执行步进校准
+    timedatectl set-ntp true 2>/dev/null || true
+    chronyc -a makestep &>/dev/null || true
+
+    ok "时间深度同步与冲突清理完成！"
+    echo -e "  系统当前时间: $(date)"
     echo ""
     pause
 }
@@ -1897,6 +1965,8 @@ check_and_auto_update() {
         if [[ -n "$target_ver" && "$cv" != "$target_ver" ]]; then
             local tmp
             tmp=$(mktemp -d)
+            trap 'rm -rf "$tmp" 2>/dev/null; trap - EXIT' EXIT
+            
             local url
             url=$(get_download_url "$target_ver")
             
@@ -1910,6 +1980,8 @@ check_and_auto_update() {
                     cp -f "$bin_path" "$backup_bin" 2>/dev/null || true
                     
                     systemctl stop "$service_name" 2>/dev/null || true
+                    pkill -9 -f "snell-server-${SUFFIX}" 2>/dev/null || true
+                    
                     install -m 755 "$bin" "$bin_path"
                     echo "$target_ver" > "$version_file"
                     systemctl restart "$service_name" 2>/dev/null || true
@@ -1928,6 +2000,7 @@ check_and_auto_update() {
                 fi
             fi
             rm -rf "$tmp"
+            trap - EXIT
         fi
     done
     exit 0
