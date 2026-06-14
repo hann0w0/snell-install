@@ -368,7 +368,7 @@ detect_arch() {
 
 ensure_deps() {
     local missing=()
-    for cmd in wget unzip; do
+    for cmd in wget unzip curl; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -550,49 +550,90 @@ apply_tfo() {
     fi
 }
 
+save_iptables() {
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save &>/dev/null || true
+    elif command -v service &>/dev/null && service iptables status &>/dev/null; then
+        service iptables save &>/dev/null || true
+    elif [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    fi
+}
+
 open_firewall() {
     local p="$1"
     info "配置防火墙 (${p})"
-    if command -v ip6tables &>/dev/null; then
-        ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -A INPUT -p tcp --dport "$p" -j ACCEPT
-        ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -A INPUT -p udp --dport "$p" -j ACCEPT
-    fi
-    if command -v iptables &>/dev/null; then
-        iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
-        iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$p" -j ACCEPT
-    fi
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+    
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw allow "${p}/tcp" &>/dev/null || true
+        ufw allow "${p}/udp" &>/dev/null || true
+        ok "防火墙 (ufw) 已放行"
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --permanent --add-port="${p}/tcp" &>/dev/null || true
         firewall-cmd --permanent --add-port="${p}/udp" &>/dev/null || true
         firewall-cmd --reload &>/dev/null || true
+        ok "防火墙 (firewalld) 已放行"
+    else
+        local opened=false
+        if command -v iptables &>/dev/null; then
+            iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+            iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+            opened=true
+        fi
+        if command -v ip6tables &>/dev/null; then
+            ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT
+            ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$p" -j ACCEPT
+            opened=true
+        fi
+        if [ "$opened" = true ]; then
+            save_iptables
+            ok "防火墙 (iptables) 已放行并保存"
+        else
+            warn "未检测到可用的防火墙工具，请手动放行端口 ${p}"
+        fi
     fi
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow "$p" &>/dev/null || true
-    fi
-    ok "防火墙已放行"
 }
 
 close_firewall() {
     local p="$1"
     [[ -n "$p" ]] || return
     info "清理防火墙规则 (${p})"
+    
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw delete allow "$p" &>/dev/null || true
-    fi
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        ufw delete allow "${p}/tcp" &>/dev/null || true
+        ufw delete allow "${p}/udp" &>/dev/null || true
+        ok "防火墙 (ufw) 规则已清理"
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --permanent --remove-port="${p}/tcp" &>/dev/null || true
         firewall-cmd --permanent --remove-port="${p}/udp" &>/dev/null || true
         firewall-cmd --reload &>/dev/null || true
+        ok "防火墙 (firewalld) 规则已清理"
+    else
+        local cleaned=false
+        if command -v iptables &>/dev/null; then
+            while iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do
+                iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || break
+            done
+            while iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; do
+                iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || break
+            done
+            cleaned=true
+        fi
+        if command -v ip6tables &>/dev/null; then
+            while ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do
+                ip6tables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || break
+            done
+            while ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; do
+                ip6tables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || break
+            done
+            cleaned=true
+        fi
+        if [ "$cleaned" = true ]; then
+            save_iptables
+            ok "防火墙 (iptables) 规则已清理并保存"
+        fi
     fi
-    if command -v iptables &>/dev/null; then
-        iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
-    fi
-    if command -v ip6tables &>/dev/null; then
-        ip6tables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
-        ip6tables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
-    fi
-    ok "防火墙规则已清理"
 }
 
 # 从配置文件读取值，只匹配第一个 = 号，避免 base64 尾部 = 被吞
@@ -1414,13 +1455,11 @@ do_logs() {
 # ============================================================
 # 8. BBR 优化
 # ============================================================
-do_bbr() {
-    clear
-    echo ""
-    hr
-    echo -e "  ${BOLD}${C} BBR 与网络深度调优${NC}"
-    hr
-    echo ""
+apply_bbr_sysctl() {
+    local max_buf="$1"
+    local def_buf_r="$2"
+    local def_buf_w="$3"
+    local mode_desc="$4"
 
     info "正在清理系统中已存在的旧 BBR 与 TCP 优化参数..."
     if [[ -f /etc/sysctl.conf ]]; then
@@ -1429,34 +1468,11 @@ do_bbr() {
 
         # 2. 清洗可能存在的任何变体旧中文注释（避免以前重复写入留下的注释叠加）
         local chinese_keywords=(
-            "文件句柄"
-            "并发"
-            "网络队列"
-            "连接优化"
-            "拥塞控制"
-            "窗口与缓冲区"
-            "大带宽"
-            "长距离"
-            "IPv6"
-            "路由缓存"
-            "邻居表"
-            "时间戳"
-            "连接回收"
-            "安全与转发"
-            "其他辅助"
-            "BBR"
-            "SNELL_SYSCTL"
-            "大缓冲区"
-            "足够跑满"
-            "跑满"
-            "丢包卡顿"
-            "短连接"
-            "延迟优化"
-            "历史 RTT"
-            "历史RTT"
-            "突发灵活"
-            "平滑暴力"
-            "BBR Blast"
+            "文件句柄" "并发" "网络队列" "连接优化" "拥塞控制" "窗口与缓冲区"
+            "大带宽" "长距离" "IPv6" "路由缓存" "邻居表" "时间戳" "连接回收"
+            "安全与转发" "其他辅助" "BBR" "SNELL_SYSCTL" "大缓冲区" "跑满"
+            "足够跑满" "丢包卡顿" "短连接" "延迟优化" "历史 RTT" "历史RTT"
+            "突发灵活" "平滑暴力" "BBR Blast"
         )
         for kw in "${chinese_keywords[@]}"; do
             sed -i "/${kw}/d" /etc/sysctl.conf
@@ -1464,38 +1480,23 @@ do_bbr() {
 
         # 3. 清理对应的配置项（不论等号两边是否有空格，都彻底移除，包含可能存在冲突的第三方 TCP/BBR 配置键名）
         local keys=(
-            # 基础文件句柄限制
             "fs.file-max" "fs.nr_open"
-            
-            # 队列与最大连接数限制
             "net.core.somaxconn" "net.ipv4.tcp_max_syn_backlog" "net.ipv4.tcp_abort_on_overflow"
             "net.ipv4.ip_local_port_range" "net.core.netdev_max_backlog" "net.ipv4.tcp_max_tw_buckets"
-            
-            # 拥塞控制及排队算法 (核心冲突点)
             "net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_fastopen"
-            
-            # 缓冲区与内存控制 (大带宽/长距离核心冲突)
             "net.ipv4.tcp_window_scaling" "net.ipv4.tcp_adv_win_scale" "net.ipv4.tcp_moderate_rcvbuf"
             "net.core.rmem_max" "net.core.wmem_max" "net.core.rmem_default" "net.core.wmem_default"
             "net.ipv4.tcp_rmem" "net.ipv4.tcp_wmem" "net.ipv4.tcp_mem"
             "net.ipv4.udp_rmem_min" "net.ipv4.udp_wmem_min" "net.ipv4.udp_mem"
-            
-            # IPv6 专项优化与邻居表限制
             "net.ipv6.conf.all.disable_ipv6" "net.ipv6.conf.default.disable_ipv6" "net.ipv6.conf.lo.disable_ipv6"
             "net.ipv6.conf.all.forwarding" "net.ipv6.conf.default.forwarding"
             "net.ipv6.route.max_size" "net.ipv6.neigh.default.gc_thresh"
             "net.ipv6.neigh.default.gc_thresh1" "net.ipv6.neigh.default.gc_thresh2" "net.ipv6.neigh.default.gc_thresh3"
-            
-            # 时间戳与网络连接回收 (包含已被内核弃用且有NAT严重 Bug 的 tcp_tw_recycle)
             "net.ipv4.tcp_timestamps" "net.ipv4.tcp_tw_reuse" "net.ipv4.tcp_tw_recycle" "net.ipv4.tcp_fin_timeout"
             "net.ipv4.tcp_slow_start_after_idle"
-            
-            # 安全与路由转发
             "net.ipv4.conf.all.rp_filter" "net.ipv4.conf.default.rp_filter" "net.ipv4.ip_forward"
             "net.ipv4.conf.all.route_localnet" "net.ipv4.tcp_rfc1337" "net.ipv4.tcp_ecn"
             "net.ipv4.tcp_syncookies"
-            
-            # SACK/FACK 网络重传控制
             "net.ipv4.tcp_no_metrics_save" "net.ipv4.tcp_sack" "net.ipv4.tcp_fack" "net.ipv4.tcp_dsack" "net.ipv4.tcp_mtu_probing"
         )
         for key in "${keys[@]}"; do
@@ -1510,8 +1511,8 @@ do_bbr() {
     # 确保文件末尾有换行符
     [[ -f /etc/sysctl.conf ]] && sed -i '$a\' /etc/sysctl.conf
 
-    info "正在写入全新 BBR 与网络协议栈调优参数..."
-    cat << 'EOF' >> /etc/sysctl.conf
+    info "正在写入全新 BBR 与网络协议栈调优参数 (${mode_desc})..."
+    cat << EOF >> /etc/sysctl.conf
 # === SNELL_SYSCTL_START ===
 # 1. 基础文件句柄限制 (适配高并发)
 fs.file-max                     = 6815744
@@ -1533,10 +1534,10 @@ net.ipv4.tcp_fastopen           = 3
 net.ipv4.tcp_window_scaling     = 1
 net.ipv4.tcp_adv_win_scale      = 1
 net.ipv4.tcp_moderate_rcvbuf    = 1
-net.core.rmem_max               = 67108864
-net.core.wmem_max               = 67108864
-net.ipv4.tcp_rmem               = 4096 87380 67108864
-net.ipv4.tcp_wmem               = 4096 65536 67108864
+net.core.rmem_max               = $max_buf
+net.core.wmem_max               = $max_buf
+net.ipv4.tcp_rmem               = 4096 $def_buf_r $max_buf
+net.ipv4.tcp_wmem               = 4096 $def_buf_w $max_buf
 net.ipv4.udp_rmem_min           = 8192
 net.ipv4.udp_wmem_min           = 8192
 
@@ -1581,7 +1582,90 @@ EOF
     sysctl --system &>/dev/null || true
     echo ""
     ok "BBR 与协议栈调优参数已成功应用！"
+    if [ "$mode_desc" != "极致大带宽 (64MB)" ]; then
+        local def_kb=$(( def_buf_r / 1024 ))
+        local max_mb=$(( max_buf / 1024 / 1024 ))
+        info "已为您量身计算并应用 TCP 缓存：默认 ${def_kb} KB，最大 ${max_mb} MB"
+    fi
     pause
+}
+
+do_bbr() {
+    while true; do
+        clear
+        echo ""
+        hr
+        echo -e "  ${BOLD}${C} BBR 与网络深度调优${NC}"
+        hr
+        echo ""
+        echo -e "  ${G}1${NC}.  极致大带宽调优 (默认推荐，缓存上限 64MB)"
+        echo -e "  ${G}2${NC}.  动态 BDP 智能调优 (根据实际延迟与带宽量身计算)"
+        echo -e "  ${G}3${NC}.  返回主菜单"
+        echo ""
+        hr
+        echo ""
+        read -p "选择操作 [1-3]: " opt
+        case "$opt" in
+            1)
+                local max_buf=67108864
+                local def_buf_r=87380
+                local def_buf_w=65536
+                apply_bbr_sysctl "$max_buf" "$def_buf_r" "$def_buf_w" "极致大带宽 (64MB)"
+                break
+                ;;
+            2)
+                local rtt=100
+                local bw=500
+                while true; do
+                    read -p "请输入您到该服务器的预估延迟 RTT (ms) [范围 10-1000, 默认 100]: " input_rtt
+                    input_rtt=${input_rtt:-100}
+                    if [[ "$input_rtt" =~ ^[0-9]+$ ]] && [ "$input_rtt" -ge 10 ] && [ "$input_rtt" -le 1000 ]; then
+                        rtt="$input_rtt"
+                        break
+                    else
+                        warn "请输入 10 到 1000 之间的正整数！"
+                    fi
+                done
+                while true; do
+                    read -p "请输入该服务器单连接设计带宽 (Mbps) [范围 10-10000, 默认 500]: " input_bw
+                    input_bw=${input_bw:-500}
+                    if [[ "$input_bw" =~ ^[0-9]+$ ]] && [ "$input_bw" -ge 10 ] && [ "$input_bw" -le 10000 ]; then
+                        bw="$input_bw"
+                        break
+                    else
+                        warn "请输入 10 到 10000 之间的正整数！"
+                    fi
+                done
+                
+                # 计算 BDP (Bytes) = bw (Mbps) * rtt (ms) * 125
+                local bdp=$(( bw * rtt * 125 ))
+                local max_buf=$(( bdp * 2 ))
+                local def_buf=$bdp
+                
+                # 限制下限：Max 不小于 4MB (4194304)，Default 不小于 256KB (262144)
+                if (( max_buf < 4194304 )); then
+                    max_buf=4194304
+                fi
+                if (( def_buf < 262144 )); then
+                    def_buf=262144
+                fi
+                
+                # 限制上限：Max 不大于 134217728 (128MB)
+                if (( max_buf > 134217728 )); then
+                    max_buf=134217728
+                fi
+                if (( def_buf > max_buf )); then
+                    def_buf=$(( max_buf / 2 ))
+                fi
+                
+                apply_bbr_sysctl "$max_buf" "$def_buf" "$def_buf" "动态 BDP (延迟:${rtt}ms, 带宽:${bw}Mbps)"
+                break
+                ;;
+            3|*)
+                return
+                ;;
+        esac
+    done
 }
 
 # ============================================================
