@@ -460,7 +460,7 @@ download_and_install() {
     local service_name
     service_name=$(get_service_name)
     systemctl stop "$service_name" 2>/dev/null || true
-    pkill -9 -f "snell-server-${SUFFIX}" 2>/dev/null || true
+    pkill -9 -x "snell-server-${SUFFIX}" 2>/dev/null || true
     
     local bin_path
     bin_path=$(get_bin_path)
@@ -2053,7 +2053,7 @@ check_and_auto_update() {
                     cp -f "$bin_path" "$backup_bin" 2>/dev/null || true
                     
                     systemctl stop "$service_name" 2>/dev/null || true
-                    pkill -9 -f "snell-server-${SUFFIX}" 2>/dev/null || true
+                    pkill -9 -x "snell-server-${SUFFIX}" 2>/dev/null || true
                     
                     install -m 755 "$bin" "$bin_path"
                     echo "$target_ver" > "$version_file"
@@ -2144,6 +2144,36 @@ smooth_progress() {
 # ============================================================
 main() {
     check_root
+
+    # 临时 Swap 自适应机制，解决小内存 VPS 因内存耗尽导致进程被系统强杀 (Killed) 的痛点
+    local mem_total=0
+    local swap_total=0
+    if [[ -f /proc/meminfo ]]; then
+        mem_total=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        mem_total=$(( mem_total / 1024 ))
+        swap_total=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
+        swap_total=$(( swap_total / 1024 ))
+    fi
+
+    if [[ "$mem_total" -gt 0 && "$mem_total" -lt 800 && "$swap_total" -eq 0 ]]; then
+        local virt=""
+        if command -v systemd-detect-virt &>/dev/null; then
+            virt=$(systemd-detect-virt 2>/dev/null || echo "")
+        fi
+        if [[ "$virt" != "lxc" && "$virt" != "openvz" && "$virt" != "docker" && "$virt" != "container" ]]; then
+            info "检测到系统物理内存较小 (${mem_total}MB) 且未配置 Swap，为防止安装进程被系统强杀 (Killed)，正在建立 1GB 临时虚拟内存..."
+            if dd if=/dev/zero of=/var/swapfile bs=1M count=1024 &>/dev/null; then
+                chmod 600 /var/swapfile
+                mkswap /var/swapfile &>/dev/null
+                if swapon /var/swapfile &>/dev/null; then
+                    ok "临时 Swap 启用成功！脚本退出时会自动释放并物理删除该缓存文件。"
+                    trap 'swapoff /var/swapfile 2>/dev/null || true; rm -f /var/swapfile; trap - EXIT' EXIT
+                else
+                    rm -f /var/swapfile
+                fi
+            fi
+        fi
+    fi
     
     # 支持 Cron 定时任务静默拉取更新，当带有参数时直接走检测函数并退出
     if [[ "${1:-}" == "--cron-check" ]]; then
