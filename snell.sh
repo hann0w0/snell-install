@@ -658,6 +658,46 @@ EOF
     ok "配置已写入 ${config_file}"
 }
 
+apply_ipv6_dualstack() {
+    local ipv6_enabled="$1"
+    # 如果没有开启 IPv6，不需要调优 bindv6only
+    [[ "$ipv6_enabled" == "true" ]] || return 0
+    
+    # 检查是否为 Linux 系统
+    [[ -f /etc/sysctl.conf ]] || return 0
+    
+    # 检查当前的值，如果已经是 0 就不需要写入了
+    local current_val
+    current_val=$(sysctl net.ipv6.bindv6only 2>/dev/null | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+    if [[ "$current_val" == "0" ]]; then
+        return 0
+    fi
+    
+    info "检测到开启了 IPv6 监听，正在优化 IPv6 双栈自适应绑定 (防止 IPv4 映射失效)..."
+    
+    # 清理已有的 net.ipv6.bindv6only
+    sed -i '/^[[:space:]#]*net.ipv6.bindv6only[[:space:]]*=/d' /etc/sysctl.conf
+    
+    # 确保文件末尾有换行符并写入
+    sed -i '$a\' /etc/sysctl.conf
+    cat << EOF >> /etc/sysctl.conf
+# === SNELL_IPV6_DUALSTACK ===
+net.ipv6.bindv6only=0
+EOF
+
+    # 刷新 sysctl
+    sysctl -p &>/dev/null || true
+    sysctl --system &>/dev/null || true
+    
+    local new_val
+    new_val=$(sysctl net.ipv6.bindv6only 2>/dev/null | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+    if [[ "$new_val" == "0" ]]; then
+        ok "IPv6 双栈绑定优化成功 (net.ipv6.bindv6only=0)。"
+    else
+        warn "尝试将 net.ipv6.bindv6only 设为 0，但当前值为: ${new_val:-未知}。如处于虚拟化环境，可忽略。"
+    fi
+}
+
 write_service() {
     local service_file service_name bin_path config_file
     service_file=$(get_service_file)
@@ -1010,6 +1050,7 @@ do_install() {
     write_config "$port" "$psk" "$ipv6" "$tfo" "$dns"
     write_service
     open_firewall "$port"
+    apply_ipv6_dualstack "$ipv6"
     apply_tfo "$tfo"
     apply_ecn "$ecn"
 
@@ -1384,6 +1425,7 @@ do_modify() {
                     echo "ipv6 = ${nv}" >> "$config_file"
                 fi
                 ok "IPv6 -> ${nv}"
+                apply_ipv6_dualstack "$nv"
                 has_changed=true
                 ;;
             4)
@@ -1647,36 +1689,72 @@ do_restart() {
 # 7. 运行日志
 # ============================================================
 do_logs() {
-    clear
-    echo ""
-    hr
-    echo -e "  ${BOLD}${C} 运行日志${NC}  ${DIM}按 Ctrl+C 退出日志并返回菜单${NC}"
-    hr
-    echo ""
-
-    auto_select_or_ask_version "查看日志" || return
+    auto_select_or_ask_version "日志管理" || return
 
     local service_name
     service_name=$(get_service_name)
 
-    # 首先展示系统服务状态
-    if systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
-        echo -e "  ${BOLD}● 系统服务状态 (${service_name}):${NC}"
-        systemctl status "$service_name" --no-pager -l 2>/dev/null || true
+    while true; do
+        clear
         echo ""
         hr
+        echo -e "  ${BOLD}${C} 日志管理 (Snell ${SUFFIX})${NC}"
+        hr
         echo ""
-    else
-        warn "服务 ${service_name} 未注册，无法展示状态"
-    fi
 
-    echo -e "  ${BOLD}● 实时运行日志 (${service_name}):${NC}"
-    # 捕获 SIGINT 信号，防止 Ctrl+C 退出整个脚本
-    trap '' INT
-    journalctl -u "$service_name" --no-pager -f -n 30 2>/dev/null || true
-    trap - INT
-    echo ""
-    pause
+        # 首先展示系统服务状态
+        if systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
+            echo -e "  ${BOLD}● 系统服务状态 (${service_name}):${NC}"
+            systemctl status "$service_name" --no-pager -l 2>/dev/null || true
+            echo ""
+            hr
+            echo ""
+        else
+            warn "服务 ${service_name} 未注册，无法展示状态"
+            echo ""
+        fi
+
+        echo -e "  ${G}1${NC}. 查看实时运行日志  ${DIM}(按 Ctrl+C 退出)${NC}"
+        echo -e "  ${G}2${NC}. 一键清理历史日志缓存"
+        echo ""
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo ""
+
+        local choice
+        read -rp "  选择 [0-2]: " choice
+        choice="${choice:-0}"
+
+        if [[ "$choice" == "0" ]]; then
+            break
+        fi
+
+        case "$choice" in
+            1)
+                echo ""
+                echo -e "  ${BOLD}● 实时运行日志 (${service_name}):${NC}"
+                # 捕获 SIGINT 信号，防止 Ctrl+C 退出整个脚本
+                trap '' INT
+                journalctl -u "$service_name" --no-pager -f -n 30 2>/dev/null || true
+                trap - INT
+                echo ""
+                pause
+                ;;
+            2)
+                echo ""
+                info "正在清理 journald 历史系统日志缓存..."
+                # 限制 journald 历史缓存大小和保留时长
+                journalctl --vacuum-size=10M &>/dev/null || true
+                journalctl --vacuum-time=1s &>/dev/null || true
+                ok "日志缓存清理完成。"
+                echo ""
+                pause
+                ;;
+            *)
+                warn "无效选项，请重新选择"
+                sleep 0.5
+                ;;
+        esac
+    done
 }
 
 # ============================================================
@@ -1805,7 +1883,9 @@ EOF
     if [[ "$current_cc" == "bbr" ]]; then
         ok "BBR 优化参数已成功应用！当前系统拥塞控制算法已切换为: ${G}${current_cc}${NC}"
     else
-        warn "BBR 优化已应用，但当前拥塞控制算法为: ${Y}${current_cc:-未知}${NC}，请检查内核是否支持。"
+        err "警告: BBR 拥塞控制算法未生效 (当前值为: ${R}${current_cc:-未知}${NC})"
+        warn "这通常是由于当前 VPS 运行在 OpenVZ、LXC 等共享内核的虚拟化容器中，宿主机内核限制了拥塞控制算法的修改。"
+        warn "如果您的 VPS 是 KVM 或 Xen 架构，请尝试升级内核并重启系统后再试。"
     fi
     echo ""
     pause
