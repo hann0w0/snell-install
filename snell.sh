@@ -1488,16 +1488,19 @@ do_logs() {
 # ============================================================
 # 8. BBR 优化
 # ============================================================
-apply_bbr_sysctl() {
-    local max_buf="$1"
-    local def_buf_r="$2"
-    local def_buf_w="$3"
-    local mode_desc="$4"
+do_bbr() {
+    clear
+    echo ""
+    hr
+    echo -e "  ${BOLD}${C} BBR Blast Smooth 深度调优${NC}"
+    hr
+    echo ""
 
-    info "正在清理系统中已存在的旧 BBR 与 TCP 优化参数..."
+    info "1/4. 正在清理系统中已存在的旧 BBR 与 TCP 优化参数及注释..."
     if [[ -f /etc/sysctl.conf ]]; then
         # 1. 尝试使用全新起止标记进行整块清理 (防止多次运行时中文注释及变量叠加)
         sed -i '/# === SNELL_SYSCTL_START ===/,/# === SNELL_SYSCTL_END ===/d' /etc/sysctl.conf
+        sed -i '/# === SNELL_BBR_START ===/,/# === SNELL_BBR_END ===/d' /etc/sysctl.conf
 
         # 2. 清洗可能存在的任何变体旧中文注释（避免以前重复写入留下的注释叠加）
         local chinese_keywords=(
@@ -1505,13 +1508,13 @@ apply_bbr_sysctl() {
             "大带宽" "长距离" "IPv6" "路由缓存" "邻居表" "时间戳" "连接回收"
             "安全与转发" "其他辅助" "BBR" "SNELL_SYSCTL" "大缓冲区" "跑满"
             "足够跑满" "丢包卡顿" "短连接" "延迟优化" "历史 RTT" "历史RTT"
-            "突发灵活" "平滑暴力" "BBR Blast"
+            "突发灵活" "平滑暴力" "BBR Blast" "平滑暴力版"
         )
         for kw in "${chinese_keywords[@]}"; do
             sed -i "/${kw}/d" /etc/sysctl.conf
         done
 
-        # 3. 清理对应的配置项（不论等号两边是否有空格，都彻底移除，包含可能存在冲突的第三方 TCP/BBR 配置键名）
+        # 3. 清理对应的配置项，包含可能存在冲突的第三方 TCP/BBR 配置键名
         local keys=(
             "fs.file-max" "fs.nr_open"
             "net.core.somaxconn" "net.ipv4.tcp_max_syn_backlog" "net.ipv4.tcp_abort_on_overflow"
@@ -1538,167 +1541,77 @@ apply_bbr_sysctl() {
 
         # 4. 清除多余的连续空白行
         sed -i '/^$/N;/^\n$/D' /etc/sysctl.conf
-        ok "旧优化参数及中文注释清理完成"
+        ok "旧优化参数及注释清理完成。"
+
+        # 5. 扫描并注释 /etc/sysctl.d/ 目录下所有配置文件中可能覆盖新配置的同名冲突参数
+        if [[ -d /etc/sysctl.d ]]; then
+            local conf_files
+            conf_files=$(find /etc/sysctl.d -name "*.conf" 2>/dev/null || true)
+            if [[ -n "$conf_files" ]]; then
+                for f in $conf_files; do
+                    local file_has_conflict=false
+                    for key in "${keys[@]}"; do
+                        if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$f" 2>/dev/null; then
+                            sed -i "s|^\([[:space:]]*${key}[[:space:]]*=.*\)|# \1 # 与 Snell BBR 冲突，由脚本自动注释|" "$f" 2>/dev/null || true
+                            file_has_conflict=true
+                        fi
+                    done
+                    if [[ "$file_has_conflict" == "true" ]]; then
+                        info "在目录 /etc/sysctl.d/ 中的配置文件 [$(basename "$f")] 中检测到同名冲突参数，已自动注释屏蔽以防新配置失效。"
+                    fi
+                done
+            fi
+        fi
     fi
 
     # 确保文件末尾有换行符
     [[ -f /etc/sysctl.conf ]] && sed -i '$a\' /etc/sysctl.conf
 
-    info "正在写入全新 BBR 与网络协议栈调优参数 (${mode_desc})..."
+    info "2/4. 启用并配置 BBR 模块开机自启..."
+    modprobe tcp_bbr 2>/dev/null || true
+    mkdir -p /etc/modules-load.d
+    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+
+    info "3/4. 写入 BBR Blast Smooth (平滑暴力版) 参数..."
     cat << EOF >> /etc/sysctl.conf
-# === SNELL_SYSCTL_START ===
-# 1. 基础文件句柄限制 (适配高并发)
-fs.file-max                     = 6815744
-fs.nr_open                      = 6815744
+# === SNELL_BBR_START ===
+# === BBR Blast Smooth (平滑暴力版) ===
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
 
-# 2. 网络队列与连接优化
-net.core.somaxconn              = 65535
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.ipv4.tcp_abort_on_overflow  = 1
-net.ipv4.ip_local_port_range    = 1024 65535
-net.core.netdev_max_backlog     = 65536
+# 大缓冲区 (64MB) - 足够跑满 1G，不至于丢包卡顿
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
 
-# 3. BBR 与 拥塞控制
-net.core.default_qdisc          = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen           = 3
+# 短连接 & 延迟优化
+net.ipv4.tcp_fin_timeout=8
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
 
-# 4. TCP 窗口与缓冲区优化 (针对大带宽/长距离链路)
-net.ipv4.tcp_window_scaling     = 1
-net.ipv4.tcp_adv_win_scale      = 1
-net.ipv4.tcp_moderate_rcvbuf    = 1
-net.core.rmem_max               = $max_buf
-net.core.wmem_max               = $max_buf
-net.ipv4.tcp_rmem               = 4096 $def_buf_r $max_buf
-net.ipv4.tcp_wmem               = 4096 $def_buf_w $max_buf
-net.ipv4.udp_rmem_min           = 8192
-net.ipv4.udp_wmem_min           = 8192
-
-# 5. IPv6 专项开启与调优
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-net.ipv6.conf.lo.disable_ipv6 = 0
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
-# 扩大 IPv6 路由缓存和邻居表，防止高并发时丢包
-net.ipv6.route.max_size = 1048576
-net.ipv6.neigh.default.gc_thresh1 = 1024
-net.ipv6.neigh.default.gc_thresh2 = 4096
-net.ipv6.neigh.default.gc_thresh3 = 8192
-
-# 6. 时间戳与连接回收
-net.ipv4.tcp_timestamps         = 1
-net.ipv4.tcp_tw_reuse           = 1
-net.ipv4.tcp_fin_timeout        = 30
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# 7. 安全与转发配置
-net.ipv4.conf.all.rp_filter     = 0
-net.ipv4.conf.default.rp_filter = 0
-net.ipv4.ip_forward             = 1
-net.ipv4.conf.all.route_localnet= 1
-net.ipv4.tcp_rfc1337            = 1
-net.ipv4.tcp_ecn                = 0
-
-# 8. 其他辅助优化
-net.ipv4.tcp_no_metrics_save    = 1
-net.ipv4.tcp_sack               = 1
-net.ipv4.tcp_fack               = 1
-net.ipv4.tcp_mtu_probing        = 1
-# === SNELL_SYSCTL_END ===
+# 避免保存历史 RTT，保持突发灵活
+net.ipv4.tcp_no_metrics_save=1
+# === SNELL_BBR_END ===
 EOF
 
-    info "正在应用内核优化参数 (sysctl -p)..."
+    info "4/4. 正在应用内核优化参数 (sysctl -p)..."
     echo ""
-    modprobe tcp_bbr &>/dev/null || true
     sysctl -p &>/dev/null || true
     sysctl --system &>/dev/null || true
     echo ""
-    ok "BBR 与协议栈调优参数已成功应用！"
-    if [ "$mode_desc" != "极致大带宽 (64MB)" ]; then
-        local def_kb=$(( def_buf_r / 1024 ))
-        local max_mb=$(( max_buf / 1024 / 1024 ))
-        info "已为您量身计算并应用 TCP 缓存：默认 ${def_kb} KB，最大 ${max_mb} MB"
-    fi
-    pause
-}
 
-do_bbr() {
-    while true; do
-        clear
-        echo ""
-        hr
-        echo -e "  ${BOLD}${C} BBR 与网络深度调优${NC}"
-        hr
-        echo ""
-        echo -e "  ${G}1${NC}.  极致大带宽调优 (默认推荐，缓存上限 64MB)"
-        echo -e "  ${G}2${NC}.  动态 BDP 智能调优 (根据实际延迟与带宽量身计算)"
-        echo -e "  ${G}3${NC}.  返回主菜单"
-        echo ""
-        hr
-        echo ""
-        read -p "选择操作 [1-3]: " opt
-        case "$opt" in
-            1)
-                local max_buf=67108864
-                local def_buf_r=87380
-                local def_buf_w=65536
-                apply_bbr_sysctl "$max_buf" "$def_buf_r" "$def_buf_w" "极致大带宽 (64MB)"
-                break
-                ;;
-            2)
-                local rtt=100
-                local bw=500
-                while true; do
-                    read -p "请输入您到该服务器的预估延迟 RTT (ms) [范围 10-1000, 默认 100]: " input_rtt
-                    input_rtt=${input_rtt:-100}
-                    if [[ "$input_rtt" =~ ^[0-9]+$ ]] && [ "$input_rtt" -ge 10 ] && [ "$input_rtt" -le 1000 ]; then
-                        rtt="$input_rtt"
-                        break
-                    else
-                        warn "请输入 10 到 1000 之间的正整数！"
-                    fi
-                done
-                while true; do
-                    read -p "请输入该服务器单连接设计带宽 (Mbps) [范围 10-10000, 默认 500]: " input_bw
-                    input_bw=${input_bw:-500}
-                    if [[ "$input_bw" =~ ^[0-9]+$ ]] && [ "$input_bw" -ge 10 ] && [ "$input_bw" -le 10000 ]; then
-                        bw="$input_bw"
-                        break
-                    else
-                        warn "请输入 10 到 10000 之间的正整数！"
-                    fi
-                done
-                
-                # 计算 BDP (Bytes) = bw (Mbps) * rtt (ms) * 125
-                local bdp=$(( bw * rtt * 125 ))
-                local max_buf=$(( bdp * 2 ))
-                local def_buf=$bdp
-                
-                # 限制下限：Max 不小于 4MB (4194304)，Default 不小于 256KB (262144)
-                if (( max_buf < 4194304 )); then
-                    max_buf=4194304
-                fi
-                if (( def_buf < 262144 )); then
-                    def_buf=262144
-                fi
-                
-                # 限制上限：Max 不大于 134217728 (128MB)
-                if (( max_buf > 134217728 )); then
-                    max_buf=134217728
-                fi
-                if (( def_buf > max_buf )); then
-                    def_buf=$(( max_buf / 2 ))
-                fi
-                
-                apply_bbr_sysctl "$max_buf" "$def_buf" "$def_buf" "动态 BDP (延迟:${rtt}ms, 带宽:${bw}Mbps)"
-                break
-                ;;
-            3|*)
-                return
-                ;;
-        esac
-    done
+    local current_cc=""
+    current_cc=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
+    if [[ "$current_cc" == "bbr" ]]; then
+        ok "BBR 优化参数已成功应用！当前系统拥塞控制算法已切换为: ${G}${current_cc}${NC}"
+    else
+        warn "BBR 优化已应用，但当前拥塞控制算法为: ${Y}${current_cc:-未知}${NC}，请检查内核是否支持。"
+    fi
+    echo ""
+    pause
 }
 
 # ============================================================
