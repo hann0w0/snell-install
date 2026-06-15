@@ -240,6 +240,160 @@ auto_select_or_ask_version() {
 }
 
 # ============================================================
+# 智能扫描并导入接管系统中的非标外部 Snell 实例
+# ============================================================
+scan_external_snell() {
+    local ext_svc=""
+    local ext_bin=""
+    local ext_cfg=""
+    local svc_files=""
+    local svc=""
+    local bname=""
+    local exec_line=""
+    local ps_line=""
+    local cmd_part=""
+    local confirm_import=""
+    local confirm_import_val=""
+    local ver_choice=""
+    local import_suffix=""
+    local import_ver_name=""
+    local target_bin=""
+    local target_cfg=""
+    local SUFFIX=""
+    local service_name=""
+    local cur_port=""
+
+    # 1. 查找 systemd 服务中非标命名的 snell 服务
+    svc_files=$(find /etc/systemd/system/ -maxdepth 1 -name "*snell*.service" 2>/dev/null || true)
+    if [[ -n "$svc_files" ]]; then
+        for svc in $svc_files; do
+            bname=$(basename "$svc")
+            if [[ "$bname" != "snell-v5.service" && "$bname" != "snell-v6.service" ]]; then
+                ext_svc="$bname"
+                exec_line=$(grep -E "^ExecStart\s*=" "$svc" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' || true)
+                if [[ -n "$exec_line" ]]; then
+                    ext_bin=$(echo "$exec_line" | awk '{print $1}')
+                    ext_cfg=$(echo "$exec_line" | grep -oE '\-c\s+\S+' | awk '{print $2}')
+                fi
+                break
+            fi
+        done
+    fi
+
+    # 2. 如果未找到服务，扫描正在运行的非标进程
+    if [[ -z "$ext_bin" ]]; then
+        ps_line=$(ps -ef 2>/dev/null | grep -E 'snell-server' | grep -v 'grep' | grep -vE 'snell-server-v[56]' | head -1 || true)
+        if [[ -n "$ps_line" ]]; then
+            cmd_part=$(echo "$ps_line" | awk '{for(i=8;i<=NF;i++) printf "%s ", $i; print ""}')
+            ext_bin=$(echo "$cmd_part" | awk '{print $1}')
+            ext_cfg=$(echo "$cmd_part" | grep -oE '\-c\s+\S+' | awk '{print $2}')
+            ext_svc="running-process"
+        fi
+    fi
+
+    # 3. 如果仍未找到，检测经典默认非标路径
+    if [[ -z "$ext_bin" ]]; then
+        if [[ -f "/usr/local/bin/snell-server" && ! -L "/usr/local/bin/snell-server" ]]; then
+            if [[ -f "/etc/snell.conf" ]]; then
+                ext_bin="/usr/local/bin/snell-server"
+                ext_cfg="/etc/snell.conf"
+            elif [[ -f "/etc/snell/snell.conf" ]]; then
+                ext_bin="/usr/local/bin/snell-server"
+                ext_cfg="/etc/snell/snell.conf"
+            fi
+        fi
+    fi
+
+    # 4. 发现目标，启动导入接管流程
+    if [[ -n "$ext_bin" && -f "$ext_bin" && -n "$ext_cfg" && -f "$ext_cfg" ]]; then
+        clear
+        echo ""
+        hr
+        echo -e "  ${BOLD}${Y} 发现未接管的外部 Snell 实例！${NC}"
+        hr
+        echo ""
+        warn "检测到当前服务器上存在非本脚本创建的旧 Snell 实例："
+        echo -e "  - 二进制路径: ${BOLD}${ext_bin}${NC}"
+        echo -e "  - 配置文件:   ${BOLD}${ext_cfg}${NC}"
+        [[ -n "$ext_svc" && "$ext_svc" != "running-process" ]] && echo -e "  - Systemd 服务: ${BOLD}${ext_svc}${NC}"
+        echo ""
+        info "将其导入接管后，即可在主面板直接看到其运行状态，"
+        info "并能通过面板修改配置、重启、卸载以及支持自动定时更新！"
+        echo ""
+
+        clear_stdin
+        read -rp "  是否立即导入并接管该实例？(Y/n) [默认 Y]: " confirm_import
+        confirm_import_val="${confirm_import:-y}"
+        if [[ "$confirm_import_val" == "y" || "$confirm_import_val" == "Y" ]]; then
+            echo ""
+            echo -e "  ${BOLD}请指定该实例的 Snell 协议版本:${NC}"
+            echo -e "  ${G}1${NC}. Snell V5 (默认)"
+            echo -e "  ${G}2${NC}. Snell V6"
+            echo ""
+            read -rp "  请选择 [1/2, 默认 1]: " ver_choice
+            import_suffix="v5"
+            import_ver_name="${V5_VERSION}"
+            if [[ "$ver_choice" == "2" ]]; then
+                import_suffix="v6"
+                import_ver_name="${V6_VERSION}"
+            fi
+
+            target_bin="${INSTALL_DIR}/snell-server-${import_suffix}"
+            target_cfg="${CONFIG_DIR}/snell-server-${import_suffix}.conf"
+
+            if [[ -f "$target_bin" ]]; then
+                err "接管失败：系统已存在标准的 Snell ${import_suffix} 实例，无法重复导入！"
+                pause
+                return
+            fi
+
+            info "正在停止旧的外部服务与进程..."
+            if [[ -n "$ext_svc" && "$ext_svc" != "running-process" ]]; then
+                systemctl stop "$ext_svc" 2>/dev/null || true
+                systemctl disable "$ext_svc" 2>/dev/null || true
+                rm -f "/etc/systemd/system/${ext_svc}" 2>/dev/null || true
+            else
+                pkill -9 -f "$ext_bin" 2>/dev/null || true
+            fi
+
+            mkdir -p "$CONFIG_DIR"
+
+            info "正在将文件规范化迁移至标准管理路径..."
+            # 如果是移动出错，降级用复制，并删除源文件
+            mv -f "$ext_bin" "$target_bin" 2>/dev/null || { cp -f "$ext_bin" "$target_bin" && rm -f "$ext_bin"; }
+            mv -f "$ext_cfg" "$target_cfg" 2>/dev/null || { cp -f "$ext_cfg" "$target_cfg" && rm -f "$ext_cfg"; }
+            chmod +x "$target_bin" 2>/dev/null || true
+            chmod 600 "$target_cfg" 2>/dev/null || true
+
+            echo "$import_ver_name" > "${CONFIG_DIR}/.version-${import_suffix}"
+
+            SUFFIX="$import_suffix"
+            write_service
+
+            service_name=$(get_service_name)
+            systemctl daemon-reload
+            systemctl enable "$service_name" &>/dev/null || true
+            systemctl start "$service_name" 2>/dev/null || true
+
+            # 防火墙端口放行
+            cur_port=$(grep -E "^listen\s*=" "$target_cfg" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | grep -oE '[0-9]+$')
+            if [[ -n "$cur_port" ]]; then
+                open_firewall "$cur_port"
+            fi
+
+            ok "成功接管外部 Snell ${import_suffix} 实例！"
+            ok "该实例已转换为标准管理模式，服务已成功启动并加载。"
+            echo ""
+            pause
+        else
+            info "已跳过导入接管。我们将忽略该外部旧实例。"
+            echo ""
+            pause
+        fi
+    fi
+}
+
+# ============================================================
 # 主菜单
 # ============================================================
 show_menu() {
@@ -403,6 +557,14 @@ random_psk() {
     fi
 }
 
+validate_psk() {
+    local psk="$1"
+    if [[ ${#psk} -eq 44 ]] && [[ "$psk" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # 验证端口号是否在有效范围内
 validate_port() {
     local port="$1"
@@ -515,11 +677,6 @@ LimitNOFILE=65535
 ExecStart=${bin_path} -c ${config_file}
 Restart=on-failure
 RestartSec=3s
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadOnlyPaths=${CONFIG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -756,15 +913,32 @@ do_install() {
     echo ""
 
     # PSK
-    local rpsk
-    if [[ "$is_installed" == "true" && -n "$CUR_PSK" ]]; then
-        rpsk="$CUR_PSK"
-        read -rp "  PSK [回车保持当前 PSK]: " ik
-    else
-        rpsk=$(random_psk)
-        read -rp "  PSK [回车随机生成]: " ik
-    fi
-    local psk="${ik:-$rpsk}"
+    local psk=""
+    while true; do
+        local rpsk
+        if [[ "$is_installed" == "true" && -n "$CUR_PSK" ]]; then
+            rpsk="$CUR_PSK"
+            read -rp "  PSK [回车保持当前 PSK]: " ik
+        else
+            rpsk=$(random_psk)
+            read -rp "  PSK [回车随机生成]: " ik
+        fi
+        psk="${ik:-$rpsk}"
+
+        if ! validate_psk "$psk"; then
+            warn "提示: 检测到您配置的 PSK (${psk}) 不是标准的 32 字节 Base64 强密钥。"
+            warn "      Snell V5/V6 官方程序对 PSK 格式有硬性校验，非标短密码极易导致服务启动时崩溃闪退！"
+            clear_stdin
+            local force_psk=""
+            read -rp "      是否确认强制使用该非标密码？(y/N) [默认 N]: " force_psk
+            local force_psk_val="${force_psk:-n}"
+            if [[ "$force_psk_val" == "y" || "$force_psk_val" == "Y" ]]; then
+                break
+            fi
+        else
+            break
+        fi
+    done
     ok "PSK: ${psk}"
     echo ""
 
@@ -1162,13 +1336,36 @@ do_modify() {
                 fi
                 ;;
             2)
-                read -rp "  新 PSK: " nk
+                local nk=""
+                while true; do
+                    read -rp "  新 PSK: " input_nk
+                    if [[ -n "$input_nk" ]]; then
+                        if ! validate_psk "$input_nk"; then
+                            warn "提示: 输入的 PSK (${input_nk}) 不是标准的 32 字节 Base64 密钥。"
+                            warn "      Snell V5/V6 官方程序对密码格式有硬性校验，非标短密码极易导致服务崩溃闪退！"
+                            clear_stdin
+                            local force_nk=""
+                            read -rp "      是否确认强制使用该非标密码？(y/N) [默认 N]: " force_nk
+                            local force_nk_val="${force_nk:-n}"
+                            if [[ "$force_nk_val" == "y" || "$force_nk_val" == "Y" ]]; then
+                                nk="$input_nk"
+                                break
+                            fi
+                        else
+                            nk="$input_nk"
+                            break
+                        fi
+                    else
+                        break
+                    fi
+                done
+
                 if [[ -n "$nk" ]]; then
                     sed -i "s|^psk\s*=.*|psk = ${nk}|" "$config_file"
-                    ok "PSK 已修改"
+                    ok "PSK -> ${nk}"
                     has_changed=true
                 else
-                    warn "未输入，PSK 未修改"
+                    warn "未输入或已取消，PSK 未修改"
                     pause
                 fi
                 ;;
@@ -2113,6 +2310,9 @@ main() {
     smooth_progress 90 100 "加载完成！"
     install_shortcut
     sleep 0.2
+
+    # 智能扫描并自动接管非标安装的旧 Snell 实例
+    scan_external_snell
     
     while true; do
         show_menu
