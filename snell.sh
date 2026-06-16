@@ -28,6 +28,7 @@ CUR_TFO=""
 CUR_DNS=""
 CUR_PORT=""
 CUR_VER=""
+CUR_MODE=""
 
 get_bin_path() {
     echo "${INSTALL_DIR}/snell-server-${SUFFIX}"
@@ -637,7 +638,7 @@ download_and_install() {
 }
 
 write_config() {
-    local port="$1" psk="$2" ipv6="$3" tfo="$4" dns="$5"
+    local port="$1" psk="$2" ipv6="$3" tfo="$4" dns="$5" mode="${6:-default}"
     mkdir -p "$CONFIG_DIR"
 
     local addr
@@ -645,6 +646,14 @@ write_config() {
 
     local config_file
     config_file=$(get_config_file)
+
+    # 1. 提取旧配置中除了核心 listen, psk, ipv6, tfo, dns, mode 外的其他所有自定义/高级字段
+    local extra_lines=""
+    if [[ -f "$config_file" ]]; then
+        extra_lines=$(grep -vE '^[[:space:]]*(listen|psk|ipv6|tfo|dns|mode)[[:space:]]*=' "$config_file" | grep -v '^[[:space:]]*\[snell-server\]' | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true)
+    fi
+
+    # 2. 覆盖写入基础字段
     cat > "$config_file" << EOF
 [snell-server]
 listen = ${addr}
@@ -653,6 +662,16 @@ ipv6 = ${ipv6}
 tfo = ${tfo}
 dns = ${dns}
 EOF
+
+    # 3. 仅在 V6 版本实例中追加写入 mode
+    if [[ "$SUFFIX" == "v6" ]]; then
+        echo "mode = ${mode}" >> "$config_file"
+    fi
+
+    # 4. 追加之前保留的其他所有自定义/高级新特性参数
+    if [[ -n "$extra_lines" ]]; then
+        echo "$extra_lines" >> "$config_file"
+    fi
 
     chmod 600 "$config_file"
     ok "配置已写入 ${config_file}"
@@ -857,6 +876,7 @@ parse_config() {
     CUR_IPV6=$(cfg_val ipv6)
     CUR_TFO=$(cfg_val tfo)
     CUR_DNS=$(cfg_val dns)
+    CUR_MODE=$(cfg_val mode)
     CUR_PORT=$(echo "$CUR_LISTEN" | grep -oE '[0-9]+$')
     CUR_VER="N/A"
     [[ -f "$vf" ]] && CUR_VER=$(cat "$vf")
@@ -1046,8 +1066,11 @@ do_install() {
     hr
     echo ""
 
+    local mode="default"
+    [[ "$is_installed" == "true" && -n "$CUR_MODE" ]] && mode="$CUR_MODE"
+
     download_and_install "$sv"
-    write_config "$port" "$psk" "$ipv6" "$tfo" "$dns"
+    write_config "$port" "$psk" "$ipv6" "$tfo" "$dns" "$mode"
     write_service
     open_firewall "$port"
     apply_ipv6_dualstack "$ipv6"
@@ -1320,19 +1343,30 @@ do_modify() {
         echo -e "  ${G}4${NC}. TFO     ${DIM}当前: ${CUR_TFO:-false}${NC}"
         echo -e "  ${G}5${NC}. DNS     ${DIM}当前: ${CUR_DNS:-未设置}${NC}"
         echo -e "  ${G}6${NC}. 重新生成随机 PSK"
+        if [[ "$SUFFIX" == "v6" ]]; then
+            echo -e "  ${G}7${NC}. 传输模式  ${DIM}当前: ${CUR_MODE:-default}${NC}"
+        fi
+        echo -e "  ${G}8${NC}. 配置其它高级/Beta新参数"
         echo ""
         echo -e "  ${DIM}0. 返回主菜单${NC}"
         echo ""
         
         local mc
-        read -rp "  选择 [0-6]: " mc
+        local max_choice=8
+        read -rp "  选择 [0-${max_choice}]: " mc
         mc="${mc:-0}"
 
         if [[ "$mc" == "0" ]]; then
             return
         fi
 
-        if [[ ! "$mc" =~ ^[0-9]+$ ]] || (( mc < 1 || mc > 6 )); then
+        if [[ ! "$mc" =~ ^[0-9]+$ ]] || (( mc < 1 || mc > max_choice )); then
+            warn "无效选项，请重新选择"
+            sleep 0.5
+            continue
+        fi
+
+        if [[ "$mc" == "7" && "$SUFFIX" != "v6" ]]; then
             warn "无效选项，请重新选择"
             sleep 0.5
             continue
@@ -1462,6 +1496,103 @@ do_modify() {
                 ok "新 PSK 已自动生成为: ${nk}"
                 has_changed=true
                 ;;
+            7)
+                clear
+                echo ""
+                hr
+                echo -e "  ${BOLD}${C} 选择 Snell V6 传输模式 (mode)${NC}"
+                hr
+                echo ""
+                echo -e "  请选择客户端和服务端一致的传输模式："
+                echo ""
+                echo -e "  ${G}1${NC}. default    ${DIM}(流量混淆 + AES 加密)${NC}"
+                echo -e "  ${G}2${NC}. unshaped   ${DIM}(无混淆，仅 AES 加密，吞吐量提升约 10%)${NC}"
+                echo -e "  ${G}3${NC}. unsafe-raw ${DIM}(无混淆 + 无加密，明文传输，仅限安全网络)${NC}"
+                echo ""
+                local ms
+                read -rp "  请选择 [1-3]: " ms
+                local nm=""
+                case "$ms" in
+                    1) nm="default" ;;
+                    2) nm="unshaped" ;;
+                    3) nm="unsafe-raw" ;;
+                esac
+                if [[ -n "$nm" ]]; then
+                    if grep -q "^mode\s*=" "$config_file"; then
+                        sed -i "s|^mode\s*=.*|mode = ${nm}|" "$config_file"
+                    else
+                        echo "mode = ${nm}" >> "$config_file"
+                    fi
+                    ok "传输模式已修改为: ${nm}"
+                    has_changed=true
+                else
+                    warn "取消或无效输入，传输模式未修改。"
+                    pause
+                fi
+                ;;
+            8)
+                clear
+                echo ""
+                hr
+                echo -e "  ${BOLD}${C} 配置其它高级/Beta新参数${NC}"
+                hr
+                echo ""
+                
+                # 打印当前已经存在的非标高级参数以供参考
+                echo -e "  ${BOLD}● 当前已配置的高级参数：${NC}"
+                local cur_extras=""
+                if [[ -f "$config_file" ]]; then
+                    cur_extras=$(grep -vE '^[[:space:]]*(listen|psk|ipv6|tfo|dns|mode)[[:space:]]*=' "$config_file" | grep -v '^[[:space:]]*\[snell-server\]' | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true)
+                fi
+                if [[ -n "$cur_extras" ]]; then
+                    echo -e "${cur_extras}" | sed 's/^/    /'
+                else
+                    echo -e "    ${DIM}(无)${NC}"
+                fi
+                echo ""
+                
+                # 交互输入
+                local ak=""
+                read -rp "  请输入要添加/修改的参数名 (例如 dns-ip-preference): " ak
+                ak=$(echo "$ak" | tr -d '[:space:]')
+                if [[ -z "$ak" ]]; then
+                    warn "已取消"
+                    pause
+                    continue
+                fi
+                
+                # 核心参数拦截
+                if [[ "$ak" =~ ^(listen|psk|ipv6|tfo|dns|mode)$ ]]; then
+                    err "错误: 核心参数 [${ak}] 请在主修改菜单中直接配置！"
+                    pause
+                    continue
+                fi
+                
+                local av=""
+                read -rp "  请输入参数值 (留空则代表删除该参数): " av
+                av=$(echo "$av" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                
+                if [[ -z "$av" ]]; then
+                    # 留空代表删除该字段
+                    if grep -qE "^[[:space:]]*${ak}[[:space:]]*=" "$config_file"; then
+                        sed -i "/^[[:space:]]*${ak}[[:space:]]*=/d" "$config_file"
+                        ok "已成功删除高级参数: ${ak}"
+                        has_changed=true
+                    else
+                        warn "未找到该参数，无需删除"
+                    fi
+                else
+                    # 写入或修改
+                    if grep -qE "^[[:space:]]*${ak}[[:space:]]*=" "$config_file"; then
+                        sed -i "s|^${ak}[[:space:]]*=.*|${ak} = ${av}|" "$config_file"
+                    else
+                        echo "${ak} = ${av}" >> "$config_file"
+                    fi
+                    ok "已成功应用配置: ${ak} = ${av}"
+                    has_changed=true
+                fi
+                pause
+                ;;
         esac
 
         if [[ "$has_changed" == "true" ]]; then
@@ -1504,7 +1635,7 @@ do_show() {
     local v6_cfg_exists=false
     
     # 局部载入变量防止 nounset 错误
-    local CUR_LISTEN CUR_PSK CUR_IPV6 CUR_TFO CUR_DNS CUR_PORT CUR_VER SUFFIX
+    local CUR_LISTEN CUR_PSK CUR_IPV6 CUR_TFO CUR_DNS CUR_PORT CUR_VER CUR_MODE SUFFIX
 
     # 1. 基础服务状态信息展示
     for sfx in "v5" "v6"; do
@@ -1614,16 +1745,23 @@ show_client_config() {
     local addr="${ip4}"
     [[ "$addr" == "N/A" || "$addr" == "YOUR_IP" ]] && addr="${ip6}"
 
+    local cur_mode
+    cur_mode=$(cfg_val mode)
+    local mode_param=""
+    if [[ "$sv" == "6" && -n "$cur_mode" ]]; then
+        mode_param=", mode=${cur_mode}"
+    fi
+
     echo ""
     echo -e "  ${BOLD}${Y} Surge 客户端${NC}"
     echo ""
     echo -e "  ${G}[Proxy]${NC}"
-    echo -e "  ${G}Snell = snell, ${addr}, ${port}, psk=${psk}, version=${sv}, udp-relay=true${NC}"
+    echo -e "  ${G}Snell = snell, ${addr}, ${port}, psk=${psk}, version=${sv}, udp-relay=true${mode_param}${NC}"
     # 如果同时有 IPv4 和 IPv6，提示备用地址
     if [[ "$ip4" != "N/A" && "$ip4" != "YOUR_IP" && "$ip6" != "N/A" && "$ip6" != "YOUR_IPv6" ]]; then
         echo ""
         echo -e "  ${DIM}# IPv6 备用:${NC}"
-        echo -e "  ${DIM}# Snell-v6 = snell, ${ip6}, ${port}, psk=${psk}, version=${sv}, udp-relay=true${NC}"
+        echo -e "  ${DIM}# Snell-v6 = snell, ${ip6}, ${port}, psk=${psk}, version=${sv}, udp-relay=true${mode_param}${NC}"
     fi
 
     echo ""
