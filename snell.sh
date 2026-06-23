@@ -50,22 +50,82 @@ get_service_file() {
     echo "/etc/systemd/system/$(get_service_name).service"
 }
 
+# ==========================================
+# 基础网络与包管理辅助函数
+# ==========================================
+http_get() {
+    local url="$1"
+    local timeout="${2:-5}"
+    local proto="${3:-}"
+    if command -v curl &>/dev/null; then
+        curl -fsSL ${proto} --connect-timeout "$timeout" "$url" 2>/dev/null
+    elif command -v wget &>/dev/null; then
+        local wget_proto=""
+        [[ "$proto" == "-4" ]] && wget_proto="-4"
+        [[ "$proto" == "-6" ]] && wget_proto="-6"
+        wget -qO- ${wget_proto} --timeout="$timeout" "$url" 2>/dev/null
+    fi
+}
+
+http_download() {
+    local url="$1"
+    local dest="$2"
+    local timeout="${3:-5}"
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null
+    elif command -v wget &>/dev/null; then
+        wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null
+    fi
+}
+
+pkg_install() {
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq "$@"
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q "$@"
+    elif command -v yum &>/dev/null; then
+        yum install -y -q "$@"
+    elif command -v pacman &>/dev/null; then
+        pacman -Sy --noconfirm "$@"
+    else
+        return 1
+    fi
+}
+
+pkg_remove() {
+    if command -v apt-get &>/dev/null; then
+        apt-get purge -y "$@" &>/dev/null || true
+        apt-get autoremove -y &>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dnf remove -y "$@" &>/dev/null || true
+    elif command -v yum &>/dev/null; then
+        yum remove -y "$@" &>/dev/null || true
+    elif command -v pacman &>/dev/null; then
+        pacman -Rns --noconfirm "$@" &>/dev/null || true
+    fi
+}
+
+confirm() {
+    local prompt="$1"
+    local default="${2:-y}"
+    clear_stdin
+    local reply
+    read -rp "  ${prompt} " reply
+    reply="${reply:-$default}"
+    [[ "$reply" == "y" || "$reply" == "Y" ]]
+}
+
 # 验证下载包在 Surge 服务器上是否存在 (通过 HEAD 快速检测)
 check_url_exists() {
     local ver="$1"
-    local test_url="${DOWNLOAD_BASE}/snell-server-${ver}-linux-amd64.zip"
+    local test_url="${DOWNLOAD_BASE}/snell-server-${ver}-linux-${ARCH:-amd64}.zip"
     if command -v curl &>/dev/null; then
         local code
         code=$(curl -fsSL -o /dev/null -w "%{http_code}" --connect-timeout 2 "$test_url" 2>/dev/null || echo "404")
         [[ "$code" == "200" ]] && return 0 || return 1
-    elif command -v wget &>/dev/null; then
-        if wget -q --spider --timeout=2 "$test_url" &>/dev/null; then
-            return 0
-        else
-            return 1
-        fi
+    else
+        wget -q --spider --timeout=2 "$test_url" &>/dev/null && return 0 || return 1
     fi
-    return 1
 }
 
 # 动态获取并双重验证官网最新可下载版本
@@ -75,17 +135,13 @@ fetch_latest_versions() {
         return
     fi
     
-    local html=""
-    if command -v curl &>/dev/null; then
-        html=$(curl -fsSL --connect-timeout 3 "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" 2>/dev/null || true)
-    else
-        html=$(wget -qO- --timeout=3 "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" 2>/dev/null || true)
-    fi
-
+    local html
+    html=$(http_get "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" 3)
+    
     if [[ -n "$html" ]]; then
         # 1. 动态探测并校验 V6 可下载最新版 (测试前 5 个候选版本)
         local v6_candidates
-        v6_candidates=$(echo "$html" | grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' | sort -V -r | head -n 5 || true)
+        v6_candidates=$(grep -oE 'v6\.[0-9]+\.[0-9]+(b[0-9]+)?' <<< "$html" | sort -V -r | head -n 5 || true)
         for candidate in $v6_candidates; do
             if check_url_exists "$candidate"; then
                 V6_VERSION="$candidate"
@@ -95,7 +151,7 @@ fetch_latest_versions() {
 
         # 2. 动态探测并校验 V5 可下载最新版 (测试前 5 个候选版本)
         local v5_candidates
-        v5_candidates=$(echo "$html" | grep -oE 'v5\.[0-9]+\.[0-9]+' | sort -V -r | head -n 5 || true)
+        v5_candidates=$(grep -oE 'v5\.[0-9]+\.[0-9]+' <<< "$html" | sort -V -r | head -n 5 || true)
         for candidate in $v5_candidates; do
             if check_url_exists "$candidate"; then
                 V5_VERSION="$candidate"
@@ -175,11 +231,7 @@ install_shortcut() {
     
     # 场景 2：如果是网络管道运行，从 GitHub 拉取
     if [[ "$success" == "false" ]]; then
-        if command -v curl &>/dev/null; then
-            curl -fsSL --connect-timeout 5 "$github_url" > "$script_dest" 2>/dev/null && success=true
-        elif command -v wget &>/dev/null; then
-            wget -q --timeout=5 -O "$script_dest" "$github_url" 2>/dev/null && success=true
-        fi
+        http_download "$github_url" "$script_dest" 5 && success=true
     fi
     
     if [[ "$success" == "true" ]]; then
@@ -220,8 +272,8 @@ auto_select_or_ask_version() {
     # 两个都存在，或者两个都不存在，让用户选择
     local v5_ver="N/A"
     local v6_ver="N/A"
-    [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
-    [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
+    [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(<"${CONFIG_DIR}/.version-v5")
+    [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(<"${CONFIG_DIR}/.version-v6")
 
     echo -e "  ${BOLD}请选择要${action}的 Snell 版本:${NC}"
     echo -e "  ${G}1${NC}. Snell (${v5_ver})"
@@ -322,10 +374,7 @@ scan_external_snell() {
         info "并能通过面板修改配置、重启、卸载以及支持自动定时更新！"
         echo ""
 
-        clear_stdin
-        read -rp "  是否立即导入并接管该实例？(Y/n) [默认 Y]: " confirm_import
-        confirm_import_val="${confirm_import:-y}"
-        if [[ "$confirm_import_val" == "y" || "$confirm_import_val" == "Y" ]]; then
+        if confirm "是否立即导入并接管该实例？(Y/n) [默认 Y]:" "y"; then
             echo ""
             echo -e "  ${BOLD}请指定该实例的 Snell 协议版本:${NC}"
             echo -e "  ${G}1${NC}. Snell V5 (默认)"
@@ -419,7 +468,7 @@ show_menu() {
         st5="○ 未安装" sc5="${DIM}"
     fi
     vt5="N/A"
-    [[ -f "$v5_ver_file" ]] && vt5=$(cat "$v5_ver_file")
+    [[ -f "$v5_ver_file" ]] && vt5=$(<"$v5_ver_file")
     if systemctl is-enabled --quiet "$v5_service" 2>/dev/null; then
         ae5="${G}是${NC}"
     else
@@ -439,7 +488,7 @@ show_menu() {
         st6="○ 未安装" sc6="${DIM}"
     fi
     vt6="N/A"
-    [[ -f "$v6_ver_file" ]] && vt6=$(cat "$v6_ver_file")
+    [[ -f "$v6_ver_file" ]] && vt6=$(<"$v6_ver_file")
     if systemctl is-enabled --quiet "$v6_service" 2>/dev/null; then
         ae6="${G}是${NC}"
     else
@@ -456,15 +505,15 @@ show_menu() {
     echo ""
     echo -e "  ${C}▎核心部署${NC}                    ${C}▎系统调优${NC}"
     echo ""
-    echo -e "  ${G}1${NC}.  安装 Snell                ${G}4${NC}.  BBR 优化"
-    echo -e "  ${G}2${NC}.  更新 Snell                ${G}5${NC}.  时间同步"
-    echo -e "  ${G}3${NC}.  卸载 Snell                ${G}6${NC}.  定时更新"
+    echo -e "  ${G}1${NC}.  安装 Snell                ${G}4${NC}.  时间同步"
+    echo -e "  ${G}2${NC}.  更新 Snell                ${G}5${NC}.  定时更新"
+    echo -e "  ${G}3${NC}.  卸载 Snell"
     echo ""
     echo -e "  ${C}▎参数配置${NC}                    ${C}▎观测维护${NC}"
     echo ""
-    echo -e "  ${G}7${NC}.  修改配置                  ${G}10${NC}. 运行日志"
-    echo -e "  ${G}8${NC}.  查看配置                  ${G}11${NC}. 更新脚本"
-    echo -e "  ${G}9${NC}.  重启服务                  ${G}0${NC}.  退出面板"
+    echo -e "  ${G}6${NC}.  修改配置                  ${G}9${NC}.  运行日志"
+    echo -e "  ${G}7${NC}.  查看配置                  ${G}10${NC}. 更新脚本"
+    echo -e "  ${G}8${NC}.  重启服务                  ${G}0${NC}.  退出面板"
     echo ""
 }
 
@@ -476,12 +525,8 @@ check_root() {
 }
 
 get_public_ip4() {
-    local ip=""
-    if command -v curl &>/dev/null; then
-        ip=$(curl -s4m 3 https://api.ipify.org || curl -s4m 3 https://ifconfig.me || curl -s4m 3 https://ip.sb || echo "")
-    elif command -v wget &>/dev/null; then
-        ip=$(wget -qT 3 -O- https://api.ipify.org || wget -qT 3 -O- https://ifconfig.me || wget -qT 3 -O- https://ip.sb || echo "")
-    fi
+    local ip
+    ip=$(http_get https://api.ipify.org 3 -4 || http_get https://ifconfig.me 3 -4 || http_get https://ip.sb 3 -4 || echo "")
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "$ip"
     else
@@ -490,12 +535,8 @@ get_public_ip4() {
 }
 
 get_public_ip6() {
-    local ip=""
-    if command -v curl &>/dev/null; then
-        ip=$(curl -s6m 3 https://api6.ipify.org || curl -s6m 3 https://ifconfig.co || curl -s6m 3 https://ip.sb || echo "")
-    elif command -v wget &>/dev/null; then
-        ip=$(wget -qT 3 -O- https://api6.ipify.org || wget -qT 3 -O- https://ifconfig.co || wget -qT 3 -O- https://ip.sb || echo "")
-    fi
+    local ip
+    ip=$(http_get https://api6.ipify.org 3 -6 || http_get https://ifconfig.co 3 -6 || http_get https://ip.sb 3 -6 || echo "")
     if [[ "$ip" == *":"* ]]; then
         echo "$ip"
     else
@@ -534,17 +575,7 @@ ensure_deps() {
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         info "安装依赖: ${missing[*]}"
-        if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y -qq "${missing[@]}"
-        elif command -v dnf &>/dev/null; then
-            dnf install -y -q "${missing[@]}"
-        elif command -v yum &>/dev/null; then
-            yum install -y -q "${missing[@]}"
-        elif command -v pacman &>/dev/null; then
-            pacman -Sy --noconfirm "${missing[@]}"
-        else
-            die "无法安装 ${missing[*]}，请手动安装"
-        fi
+        pkg_install "${missing[@]}" || die "无法安装 ${missing[*]}，请手动安装"
     fi
 }
 
@@ -743,32 +774,30 @@ EOF
     systemctl daemon-reload
 }
 
+apply_sysctl() {
+    local key="$1"
+    local val="$2"
+    sysctl -w "${key}=${val}" &>/dev/null || true
+    if grep -q "${key}" /etc/sysctl.conf 2>/dev/null; then
+        sed -i "s/${key}=.*/${key}=${val}/" /etc/sysctl.conf
+    else
+        echo "${key}=${val}" >> /etc/sysctl.conf
+    fi
+}
+
 apply_ecn() {
     local v="$1"
     if [[ "$v" == "true" ]]; then
-        sysctl -w net.ipv4.tcp_ecn=1 &>/dev/null || true
-        if grep -q "net.ipv4.tcp_ecn" /etc/sysctl.conf 2>/dev/null; then
-            sed -i 's/net.ipv4.tcp_ecn=.*/net.ipv4.tcp_ecn=1/' /etc/sysctl.conf
-        else
-            echo "net.ipv4.tcp_ecn=1" >> /etc/sysctl.conf
-        fi
+        apply_sysctl "net.ipv4.tcp_ecn" "1"
         ok "ECN 已启用"
     else
-        sysctl -w net.ipv4.tcp_ecn=0 &>/dev/null || true
-        if grep -q "net.ipv4.tcp_ecn" /etc/sysctl.conf 2>/dev/null; then
-            sed -i 's/net.ipv4.tcp_ecn=.*/net.ipv4.tcp_ecn=0/' /etc/sysctl.conf
-        fi
+        apply_sysctl "net.ipv4.tcp_ecn" "0"
     fi
 }
 
 apply_tfo() {
     if [[ "$1" == "true" ]]; then
-        sysctl -w net.ipv4.tcp_fastopen=3 &>/dev/null || true
-        if grep -q "net.ipv4.tcp_fastopen" /etc/sysctl.conf 2>/dev/null; then
-            sed -i 's/net.ipv4.tcp_fastopen=.*/net.ipv4.tcp_fastopen=3/' /etc/sysctl.conf
-        else
-            echo "net.ipv4.tcp_fastopen=3" >> /etc/sysctl.conf
-        fi
+        apply_sysctl "net.ipv4.tcp_fastopen" "3"
         ok "TFO 已启用"
     fi
 }
@@ -782,6 +811,24 @@ save_iptables() {
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
     fi
+}
+
+_ipt_open() {
+    local cmd="$1"
+    local port="$2"
+    $cmd -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || $cmd -I INPUT -p tcp --dport "$port" -j ACCEPT
+    $cmd -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || $cmd -I INPUT -p udp --dport "$port" -j ACCEPT
+}
+
+_ipt_close() {
+    local cmd="$1"
+    local port="$2"
+    while $cmd -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+        $cmd -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+    done
+    while $cmd -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; do
+        $cmd -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || break
+    done
 }
 
 open_firewall() {
@@ -800,13 +847,11 @@ open_firewall() {
     else
         local opened=false
         if command -v iptables &>/dev/null; then
-            iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
-            iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+            _ipt_open iptables "$p"
             opened=true
         fi
         if command -v ip6tables &>/dev/null; then
-            ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT
-            ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$p" -j ACCEPT
+            _ipt_open ip6tables "$p"
             opened=true
         fi
         if [ "$opened" = true ]; then
@@ -835,21 +880,11 @@ close_firewall() {
     else
         local cleaned=false
         if command -v iptables &>/dev/null; then
-            while iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do
-                iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || break
-            done
-            while iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; do
-                iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || break
-            done
+            _ipt_close iptables "$p"
             cleaned=true
         fi
         if command -v ip6tables &>/dev/null; then
-            while ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do
-                ip6tables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || break
-            done
-            while ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; do
-                ip6tables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || break
-            done
+            _ipt_close ip6tables "$p"
             cleaned=true
         fi
         if [ "$cleaned" = true ]; then
@@ -879,7 +914,7 @@ parse_config() {
     CUR_MODE=$(cfg_val mode)
     CUR_PORT=$(echo "$CUR_LISTEN" | grep -oE '[0-9]+$')
     CUR_VER="N/A"
-    [[ -f "$vf" ]] && CUR_VER=$(cat "$vf")
+    [[ -f "$vf" ]] && CUR_VER=$(<"$vf")
 }
 
 # ============================================================
@@ -923,10 +958,7 @@ do_install() {
     if [[ -f "$bin_path" ]]; then
         is_installed=true
         warn "已检测到已安装的 Snell Server ${SUFFIX}"
-        clear_stdin
-        read -rp "  覆盖安装？(Y/n) [默认 Y]: " ow
-        local ow_val="${ow:-y}"
-        [[ "$ow_val" == "y" || "$ow_val" == "Y" ]] || { info "已取消"; pause; return; }
+        confirm "覆盖安装？(Y/n) [默认 Y]:" "y" || { info "已取消"; pause; return; }
         echo ""
         parse_config &>/dev/null || true
     fi
@@ -988,13 +1020,7 @@ do_install() {
         if ! validate_psk "$psk"; then
             warn "提示: 检测到您配置的 PSK (${psk}) 不是标准的 32 字节 Base64 强密钥。"
             warn "      Snell V5/V6 官方程序对 PSK 格式有硬性校验，非标短密码极易导致服务启动时崩溃闪退！"
-            clear_stdin
-            local force_psk=""
-            read -rp "      是否确认强制使用该非标密码？(y/N) [默认 N]: " force_psk
-            local force_psk_val="${force_psk:-n}"
-            if [[ "$force_psk_val" == "y" || "$force_psk_val" == "Y" ]]; then
-                break
-            fi
+            confirm "    是否确认强制使用该非标密码？(y/N) [默认 N]:" "n" && break
         else
             break
         fi
@@ -1057,10 +1083,7 @@ do_install() {
     echo -e "  DNS  ......  ${BOLD}${dns}${NC}"
     echo -e "  UDP  ......  ${BOLD}启用${NC}"
     echo ""
-    clear_stdin
-    read -rp "  确认安装? (Y/n) [默认 Y]: " cf
-    local cf_val="${cf:-y}"
-    [[ "$cf_val" == "n" || "$cf_val" == "N" ]] && { info "已取消"; pause; return; }
+    confirm "确认安装? (Y/n) [默认 Y]:" "y" || { info "已取消"; pause; return; }
 
     echo ""
     hr
@@ -1120,7 +1143,7 @@ do_update() {
     echo ""
 
     local cv="N/A"
-    [[ -f "$version_file" ]] && cv=$(cat "$version_file")
+    [[ -f "$version_file" ]] && cv=$(<"$version_file")
     info "当前 Snell ${SUFFIX} 版本: ${cv}"
     echo ""
 
@@ -1140,8 +1163,7 @@ do_update() {
     fi
 
     echo -e "  准备将 Snell ${SUFFIX} 更新至目标版本: ${target_ver}"
-    read -rp "  是否继续？(Y/n) " yn
-    [[ "$yn" == "n" || "$yn" == "N" ]] && { info "已取消"; pause; return; }
+    confirm "是否继续？(Y/n)" "y" || { info "已取消"; pause; return; }
 
     echo ""
     # 1. 升级前先备份当前二进制
@@ -1173,6 +1195,30 @@ do_update() {
 # ============================================================
 # 3. 卸载
 # ============================================================
+_uninstall_version() {
+    local ver="$1"
+    local port="$2"
+    local keep_cfg_dir="${3:-false}"
+
+    info "正在卸载 Snell ${ver^^}..."
+    if [[ -n "$port" ]]; then
+        close_firewall "$port"
+    fi
+    systemctl stop "snell-${ver}" 2>/dev/null || true
+    systemctl disable "snell-${ver}" 2>/dev/null || true
+    rm -f "${INSTALL_DIR}/snell-server-${ver}" "/etc/systemd/system/snell-${ver}.service" "${CONFIG_DIR}/.version-${ver}"
+    
+    if [[ "$keep_cfg_dir" == "false" ]]; then
+        rm -f "${CONFIG_DIR}/snell-server-${ver}.conf"
+        local other="v5"
+        [[ "$ver" == "v5" ]] && other="v6"
+        if [[ ! -f "${INSTALL_DIR}/snell-server-${other}" ]]; then
+            rm -rf "$CONFIG_DIR" 2>/dev/null || true
+        fi
+    fi
+    ok "Snell ${ver^^} 已卸载并清除配置、自启与防火墙端口"
+}
+
 do_uninstall() {
     clear
     echo ""
@@ -1201,8 +1247,8 @@ do_uninstall() {
         # 两个都存在，让用户选择
         local v5_ver="N/A"
         local v6_ver="N/A"
-        [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(cat "${CONFIG_DIR}/.version-v5")
-        [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(cat "${CONFIG_DIR}/.version-v6")
+        [[ -f "${CONFIG_DIR}/.version-v5" ]] && v5_ver=$(<"${CONFIG_DIR}/.version-v5")
+        [[ -f "${CONFIG_DIR}/.version-v6" ]] && v6_ver=$(<"${CONFIG_DIR}/.version-v6")
 
         echo -e "  ${BOLD}请选择要卸载的 Snell 版本:${NC}"
         echo -e "  ${G}1${NC}. Snell (${v5_ver})"
@@ -1221,16 +1267,15 @@ do_uninstall() {
         echo ""
     fi
 
-    local cf
+    local cf=false
     if [[ "$mode" == "all" ]]; then
         warn "将停止并删除所有的 Snell 服务"
-        read -rp "  确认同时卸载 V5 和 V6？(Y/n) " cf
+        confirm "确认同时卸载 V5 和 V6？(Y/n)" "y" && cf=true
     else
         warn "将停止并删除 Snell ${mode} 服务"
-        read -rp "  确认卸载 Snell ${mode}？(Y/n) " cf
+        confirm "确认卸载 Snell ${mode}？(Y/n)" "y" && cf=true
     fi
-    cf="${cf:-Y}"
-    [[ "$cf" == "y" || "$cf" == "Y" ]] || { info "已取消"; pause; return; }
+    [[ "$cf" == "true" ]] || { info "已取消"; pause; return; }
 
     # 卸载前获取端口号以便后续清理防火墙规则
     local v5_port=""
@@ -1246,39 +1291,15 @@ do_uninstall() {
 
     # 执行服务停止与文件删除
     if [[ "$mode" == "v5" || "$mode" == "all" ]]; then
-        info "正在卸载 Snell V5..."
-        if [[ -n "$v5_port" ]]; then
-            close_firewall "$v5_port"
-        fi
-        systemctl stop snell-v5 2>/dev/null || true
-        systemctl disable snell-v5 2>/dev/null || true
-        rm -f "${INSTALL_DIR}/snell-server-v5" "/etc/systemd/system/snell-v5.service" "${CONFIG_DIR}/.version-v5"
-        if [[ "$mode" == "v5" ]]; then
-            rm -f "$v5_cfg"
-            # 检查如果此时 V6 也不存在了，则清理整个配置目录
-            if [[ ! -f "${INSTALL_DIR}/snell-server-v6" ]]; then
-                rm -rf "$CONFIG_DIR" 2>/dev/null || true
-            fi
-        fi
-        ok "Snell V5 已卸载并清除配置、自启与防火墙端口"
+        local keep_cfg_dir=false
+        [[ "$mode" == "all" ]] && keep_cfg_dir=true
+        _uninstall_version "v5" "$v5_port" "$keep_cfg_dir"
     fi
 
     if [[ "$mode" == "v6" || "$mode" == "all" ]]; then
-        info "正在卸载 Snell V6..."
-        if [[ -n "$v6_port" ]]; then
-            close_firewall "$v6_port"
-        fi
-        systemctl stop snell-v6 2>/dev/null || true
-        systemctl disable snell-v6 2>/dev/null || true
-        rm -f "${INSTALL_DIR}/snell-server-v6" "/etc/systemd/system/snell-v6.service" "${CONFIG_DIR}/.version-v6"
-        if [[ "$mode" == "v6" ]]; then
-            rm -f "$v6_cfg"
-            # 检查如果此时 V5 也不存在了，则清理整个配置目录
-            if [[ ! -f "${INSTALL_DIR}/snell-server-v5" ]]; then
-                rm -rf "$CONFIG_DIR" 2>/dev/null || true
-            fi
-        fi
-        ok "Snell V6 已卸载并清除配置、自启与防火墙端口"
+        local keep_cfg_dir=false
+        [[ "$mode" == "all" ]] && keep_cfg_dir=true
+        _uninstall_version "v6" "$v6_port" "$keep_cfg_dir"
     fi
 
     systemctl daemon-reload
@@ -1418,11 +1439,7 @@ do_modify() {
                         if ! validate_psk "$input_nk"; then
                             warn "提示: 输入的 PSK (${input_nk}) 不是标准的 32 字节 Base64 密钥。"
                             warn "      Snell V5/V6 官方程序对密码格式有硬性校验，非标短密码极易导致服务崩溃闪退！"
-                            clear_stdin
-                            local force_nk=""
-                            read -rp "      是否确认强制使用该非标密码？(y/N) [默认 N]: " force_nk
-                            local force_nk_val="${force_nk:-n}"
-                            if [[ "$force_nk_val" == "y" || "$force_nk_val" == "Y" ]]; then
+                            if confirm "      是否确认强制使用该非标密码？(y/N) [默认 N]:" "n"; then
                                 nk="$input_nk"
                                 break
                             fi
@@ -1597,9 +1614,7 @@ do_modify() {
 
         if [[ "$has_changed" == "true" ]]; then
             echo ""
-            read -rp "  是否立即重启 Snell ${SUFFIX} 使配置生效? (Y/n) " rr
-            rr="${rr:-Y}"
-            if [[ "$rr" == "y" || "$rr" == "Y" ]]; then
+            if confirm "是否立即重启 Snell ${SUFFIX} 使配置生效? (Y/n)" "y"; then
                 local service_name
                 service_name=$(get_service_name)
                 systemctl restart "$service_name" && ok "服务已成功重启并应用新配置" || err "重启服务失败"
@@ -1896,141 +1911,7 @@ do_logs() {
 }
 
 # ============================================================
-
-
-# ============================================================
-# 8. BBR 优化
-# ============================================================
-do_bbr() {
-    clear
-    echo ""
-    hr
-    echo -e "  ${BOLD}${C} BBR Blast Smooth 深度调优${NC}"
-    hr
-    echo ""
-
-    info "1/4. 正在清理系统中已存在的旧 BBR 与 TCP 优化参数及注释..."
-    if [[ -f /etc/sysctl.conf ]]; then
-        # 1. 尝试使用全新起止标记进行整块清理 (防止多次运行时中文注释及变量叠加)
-        sed -i '/# === SNELL_SYSCTL_START ===/,/# === SNELL_SYSCTL_END ===/d' /etc/sysctl.conf
-        sed -i '/# === SNELL_BBR_START ===/,/# === SNELL_BBR_END ===/d' /etc/sysctl.conf
-
-        # 2. 清洗可能存在的任何变体旧中文注释（避免以前重复写入留下的注释叠加）
-        local chinese_keywords=(
-            "文件句柄" "并发" "网络队列" "连接优化" "拥塞控制" "窗口与缓冲区"
-            "大带宽" "长距离" "IPv6" "路由缓存" "邻居表" "时间戳" "连接回收"
-            "安全与转发" "其他辅助" "BBR" "SNELL_SYSCTL" "大缓冲区" "跑满"
-            "足够跑满" "丢包卡顿" "短连接" "延迟优化" "历史 RTT" "历史RTT"
-            "突发灵活" "平滑暴力" "BBR Blast" "平滑暴力版"
-        )
-        for kw in "${chinese_keywords[@]}"; do
-            sed -i "/${kw}/d" /etc/sysctl.conf
-        done
-
-        # 3. 清理对应的配置项，包含可能存在冲突的第三方 TCP/BBR 配置键名
-        local keys=(
-            "fs.file-max" "fs.nr_open"
-            "net.core.somaxconn" "net.ipv4.tcp_max_syn_backlog" "net.ipv4.tcp_abort_on_overflow"
-            "net.ipv4.ip_local_port_range" "net.core.netdev_max_backlog" "net.ipv4.tcp_max_tw_buckets"
-            "net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_fastopen"
-            "net.ipv4.tcp_window_scaling" "net.ipv4.tcp_adv_win_scale" "net.ipv4.tcp_moderate_rcvbuf"
-            "net.core.rmem_max" "net.core.wmem_max" "net.core.rmem_default" "net.core.wmem_default"
-            "net.ipv4.tcp_rmem" "net.ipv4.tcp_wmem" "net.ipv4.tcp_mem"
-            "net.ipv4.udp_rmem_min" "net.ipv4.udp_wmem_min" "net.ipv4.udp_mem"
-            "net.ipv6.conf.all.disable_ipv6" "net.ipv6.conf.default.disable_ipv6" "net.ipv6.conf.lo.disable_ipv6"
-            "net.ipv6.conf.all.forwarding" "net.ipv6.conf.default.forwarding"
-            "net.ipv6.route.max_size" "net.ipv6.neigh.default.gc_thresh"
-            "net.ipv6.neigh.default.gc_thresh1" "net.ipv6.neigh.default.gc_thresh2" "net.ipv6.neigh.default.gc_thresh3"
-            "net.ipv4.tcp_timestamps" "net.ipv4.tcp_tw_reuse" "net.ipv4.tcp_tw_recycle" "net.ipv4.tcp_fin_timeout"
-            "net.ipv4.tcp_slow_start_after_idle"
-            "net.ipv4.conf.all.rp_filter" "net.ipv4.conf.default.rp_filter" "net.ipv4.ip_forward"
-            "net.ipv4.conf.all.route_localnet" "net.ipv4.tcp_rfc1337" "net.ipv4.tcp_ecn"
-            "net.ipv4.tcp_syncookies"
-            "net.ipv4.tcp_no_metrics_save" "net.ipv4.tcp_sack" "net.ipv4.tcp_fack" "net.ipv4.tcp_dsack" "net.ipv4.tcp_mtu_probing"
-        )
-        for key in "${keys[@]}"; do
-            sed -i "/^[[:space:]#]*${key}[[:space:]]*=/d" /etc/sysctl.conf
-        done
-
-        # 4. 清除多余的连续空白行
-        sed -i '/^$/N;/^\n$/D' /etc/sysctl.conf
-        ok "旧优化参数及注释清理完成。"
-
-        # 5. 扫描并注释 /etc/sysctl.d/ 目录下所有配置文件中可能覆盖新配置的同名冲突参数
-        if [[ -d /etc/sysctl.d ]]; then
-            local conf_files
-            conf_files=$(find /etc/sysctl.d -name "*.conf" 2>/dev/null || true)
-            if [[ -n "$conf_files" ]]; then
-                for f in $conf_files; do
-                    local file_has_conflict=false
-                    for key in "${keys[@]}"; do
-                        if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$f" 2>/dev/null; then
-                            sed -i "s|^\([[:space:]]*${key}[[:space:]]*=.*\)|# \1 # 与 Snell BBR 冲突，由脚本自动注释|" "$f" 2>/dev/null || true
-                            file_has_conflict=true
-                        fi
-                    done
-                    if [[ "$file_has_conflict" == "true" ]]; then
-                        info "在目录 /etc/sysctl.d/ 中的配置文件 [$(basename "$f")] 中检测到同名冲突参数，已自动注释屏蔽以防新配置失效。"
-                    fi
-                done
-            fi
-        fi
-    fi
-
-    # 确保文件末尾有换行符
-    [[ -f /etc/sysctl.conf ]] && sed -i '$a\' /etc/sysctl.conf
-
-    info "2/4. 启用并配置 BBR 模块开机自启..."
-    modprobe tcp_bbr 2>/dev/null || true
-    mkdir -p /etc/modules-load.d
-    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
-
-    info "3/4. 写入 BBR Blast Smooth (平滑暴力版) 参数..."
-    cat << EOF >> /etc/sysctl.conf
-# === SNELL_BBR_START ===
-# === BBR Blast Smooth (平滑暴力版) ===
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-
-# 大缓冲区 (64MB) - 足够跑满 1G，不至于丢包卡顿
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
-
-# 短连接 & 延迟优化
-net.ipv4.tcp_fin_timeout=8
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_sack=1
-
-# 避免保存历史 RTT，保持突发灵活
-net.ipv4.tcp_no_metrics_save=1
-# === SNELL_BBR_END ===
-EOF
-
-    info "4/4. 正在应用内核优化参数 (sysctl -p)..."
-    echo ""
-    sysctl -p &>/dev/null || true
-    sysctl --system &>/dev/null || true
-    echo ""
-
-    local current_cc=""
-    current_cc=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk -F= '{print $2}' | tr -d '[:space:]' || echo "")
-    if [[ "$current_cc" == "bbr" ]]; then
-        ok "BBR 优化参数已成功应用！当前系统拥塞控制算法已切换为: ${G}${current_cc}${NC}"
-    else
-        err "警告: BBR 拥塞控制算法未生效 (当前值为: ${R}${current_cc:-未知}${NC})"
-        warn "这通常是由于当前 VPS 运行在 OpenVZ、LXC 等共享内核的虚拟化容器中，宿主机内核限制了拥塞控制算法的修改。"
-        warn "如果您的 VPS 是 KVM 或 Xen 架构，请尝试升级内核并重启系统后再试。"
-    fi
-    echo ""
-    pause
-}
-
-# ============================================================
-# 9. 时间同步
+# 8. 时间同步
 # ============================================================
 do_sync_time() {
     clear
@@ -2065,26 +1946,13 @@ do_sync_time() {
         echo ""
         clear_stdin
         local sync_reinstall=""
-        read -rp "  是否要重新安装并净化时间同步服务？(y/N) [默认 N]: " sync_reinstall
-        local sync_reinstall_val="${sync_reinstall:-n}"
-        if [[ "$sync_reinstall_val" != "y" && "$sync_reinstall_val" != "Y" ]]; then
-            return
-        fi
+        confirm "是否要重新安装并净化时间同步服务？(y/N) [默认 N]:" "n" || return
 
         info "正在清除当前系统关于时间同步的所有数据与残留..."
         systemctl disable --now chrony 2>/dev/null || true
         systemctl disable --now chronyd 2>/dev/null || true
 
-        if command -v apt-get &>/dev/null; then
-            apt-get purge -y chrony &>/dev/null || true
-            apt-get autoremove -y &>/dev/null || true
-        elif command -v dnf &>/dev/null; then
-            dnf remove -y chrony &>/dev/null || true
-        elif command -v yum &>/dev/null; then
-            yum remove -y chrony &>/dev/null || true
-        elif command -v pacman &>/dev/null; then
-            pacman -Rns --noconfirm chrony &>/dev/null || true
-        fi
+        pkg_remove chrony
 
         rm -rf /etc/chrony /etc/chrony.conf /etc/chrony/chrony.conf /etc/chrony.keys /var/lib/chrony /var/log/chrony 2>/dev/null || true
         ok "时间同步服务已彻底清除！"
@@ -2133,22 +2001,14 @@ do_sync_time() {
     
     # 7. 安装与配置 Chrony
     info "3/4. 正在安装并配置 chrony..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y chrony -qq
-    elif command -v dnf &>/dev/null; then
-        dnf install -y -q chrony
-    elif command -v yum &>/dev/null; then
-        yum install -y -q chrony
-    elif command -v pacman &>/dev/null; then
-        pacman -Sy --noconfirm chrony
-    fi
+    pkg_install chrony
 
     # 检测 IP 归属地，决定最优 NTP 服务器配置
     local country=""
     info "正在检测当前主机的公网 IP 归属以配置最优 NTP 服务器..."
-    country=$(curl -sL --max-time 3 https://ipinfo.io/country | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)
+    country=$(http_get https://ipinfo.io/country 3 | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)
     if [[ -z "$country" ]]; then
-        country=$(curl -sL --max-time 3 https://ipapi.co/country/ | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)
+        country=$(http_get https://ipapi.co/country/ 3 | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)
     fi
 
     local chrony_conf="/etc/chrony.conf"
@@ -2218,7 +2078,7 @@ EOF
 }
 
 # ============================================================
-# 10. 定时更新设置 (中国时间 03:30)
+# 9. 定时更新设置 (中国时间 03:30)
 # ============================================================
 get_cron_time() {
     echo "30 3 * * *"
@@ -2247,8 +2107,7 @@ do_cron_menu() {
         echo -e "  当前状态: ${G}已开启${NC}"
         echo -e "  执行时间: 中国时间每天 ${Y}03:30${NC} (系统排程: ${cron_time})"
         echo ""
-        read -rp "  是否关闭定时自动更新任务？(y/N) " opt
-        if [[ "$opt" == "y" || "$opt" == "Y" ]]; then
+        if confirm "是否关闭定时自动更新任务？(y/N)" "n"; then
             sed -i '\/--cron-check/d' /etc/crontab
             # 重启 cron 服务以应用修改
             systemctl restart cron &>/dev/null || systemctl restart crond &>/dev/null || true
@@ -2260,8 +2119,7 @@ do_cron_menu() {
         echo -e "  当前状态: ${DIM}已关闭${NC}"
         echo -e "  执行时间: 中国时间每天 ${Y}03:30${NC} (系统排程: ${cron_time})"
         echo ""
-        read -rp "  是否开启定时自动更新任务？(Y/n) " opt
-        if [[ "$opt" != "n" && "$opt" != "N" ]]; then
+        if confirm "是否开启定时自动更新任务？(Y/n)" "y"; then
             # 确保 crontab 文件末尾有换行符
             [[ -f /etc/crontab ]] && sed -i '$a\' /etc/crontab
             echo "$cron_job" >> /etc/crontab
@@ -2277,7 +2135,7 @@ do_cron_menu() {
 }
 
 # ============================================================
-# 11. 更新管理脚本自身
+# 10. 更新管理脚本自身
 # ============================================================
 update_self() {
     clear
@@ -2298,11 +2156,7 @@ update_self() {
     tmp=$(mktemp)
     
     local success=false
-    if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 5 "$github_url" > "$tmp" 2>/dev/null && success=true
-    elif command -v wget &>/dev/null; then
-        wget -q --timeout=5 -O "$tmp" "$github_url" 2>/dev/null && success=true
-    fi
+    http_download "$github_url" "$tmp" 5 && success=true
 
     if [[ "$success" == "true" ]]; then
         # 简单校验下载到的文件是否包含 bash 声明，防止下到 404 网页或空白
@@ -2352,7 +2206,7 @@ check_and_auto_update() {
 
         # 读取当前版本号
         local cv="N/A"
-        [[ -f "$version_file" ]] && cv=$(cat "$version_file")
+        [[ -f "$version_file" ]] && cv=$(<"$version_file")
         [[ "$cv" == "N/A" ]] && continue
         
         local target_ver=""
@@ -2414,13 +2268,14 @@ smooth_progress() {
     local desc="$3"
     local run_cmd="${4:-}"
     local width=30
+    local filled empty bar p i ch current_pct pid spin spin_idx
 
     # 如果没有要跑的后台命令，直接平滑步进绘制
     if [[ -z "$run_cmd" ]]; then
         for ((p=start_pct; p<=end_pct; p+=2)); do
-            local filled=$(( p * width / 100 ))
-            local empty=$(( width - filled ))
-            local bar=""
+            filled=$(( p * width / 100 ))
+            empty=$(( width - filled ))
+            bar=""
             for ((i=0; i<filled; i++)); do bar="${bar}█"; done
             for ((i=0; i<empty; i++)); do bar="${bar}░"; done
             printf "\r  ${C}初始化${NC} [${G}%s${NC}] %3d%%  %s" "$bar" "$p" "$desc"
@@ -2431,10 +2286,10 @@ smooth_progress() {
 
     # 如果有后台任务，启动任务并在等待时播放转圈动画 + 进度平缓上升
     bash -c "$run_cmd" &
-    local pid=$!
-    local current_pct=$start_pct
-    local spin='-\|/'
-    local spin_idx=0
+    pid=$!
+    current_pct=$start_pct
+    spin='-\|/'
+    spin_idx=0
 
     while kill -0 $pid 2>/dev/null; do
         # 进度值在等待中缓慢增加，但不超过目标结束值的前一位
@@ -2442,13 +2297,13 @@ smooth_progress() {
             (( current_pct++ ))
         fi
         
-        local filled=$(( current_pct * width / 100 ))
-        local empty=$(( width - filled ))
-        local bar=""
+        filled=$(( current_pct * width / 100 ))
+        empty=$(( width - filled ))
+        bar=""
         for ((i=0; i<filled; i++)); do bar="${bar}█"; done
         for ((i=0; i<empty; i++)); do bar="${bar}░"; done
         
-        local ch="${spin:$spin_idx:1}"
+        ch="${spin:$spin_idx:1}"
         printf "\r  ${C}初始化${NC} [${G}%s${NC}] %3d%% [%s] %s" "$bar" "$current_pct" "$ch" "$desc"
         
         spin_idx=$(( (spin_idx + 1) % 4 ))
@@ -2457,9 +2312,9 @@ smooth_progress() {
 
     # 任务结束后，平滑拉满到 end_pct
     for ((p=current_pct; p<=end_pct; p+=2)); do
-        local filled=$(( p * width / 100 ))
-        local empty=$(( width - filled ))
-        local bar=""
+        filled=$(( p * width / 100 ))
+        empty=$(( width - filled ))
+        bar=""
         for ((i=0; i<filled; i++)); do bar="${bar}█"; done
         for ((i=0; i<empty; i++)); do bar="${bar}░"; done
         printf "\r  ${C}初始化${NC} [${G}%s${NC}] %3d%% [✓] %s" "$bar" "$p" "$desc"
@@ -2534,19 +2389,18 @@ main() {
     
     while true; do
         show_menu
-        read -rp "  选择 [0-11]: " ch
+        read -rp "  选择 [0-10]: " ch
         case "$ch" in
             1) do_install ;;
             2) do_update ;;
             3) do_uninstall ;;
-            4) do_bbr ;;
-            5) do_sync_time ;;
-            6) do_cron_menu ;;
-            7) do_modify ;;
-            8) do_show ;;
-            9) do_restart ;;
-            10) do_logs ;;
-            11) update_self ;;
+            4) do_sync_time ;;
+            5) do_cron_menu ;;
+            6) do_modify ;;
+            7) do_show ;;
+            8) do_restart ;;
+            9) do_logs ;;
+            10) update_self ;;
             0) echo ""; info "再见"; echo ""; exit 0 ;;
             *) warn "无效选项"; sleep 0.3 ;;
         esac
