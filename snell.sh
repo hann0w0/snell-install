@@ -11,7 +11,7 @@ set -uo pipefail
 # 版本与路径 (解耦多实例路径)
 # ============================================================
 V5_VERSION="v5.0.1"   # 默认兜底版本
-V6_VERSION="v6.0.0b2"  # 默认兜底版本
+V6_VERSION="v6.0.0b4"  # 默认兜底版本
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/snell"
 DOWNLOAD_BASE="https://dl.nssurge.com/snell"
